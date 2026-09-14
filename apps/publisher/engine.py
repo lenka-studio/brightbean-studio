@@ -30,6 +30,7 @@ from django.utils import timezone
 from apps.composer.models import PlatformPost
 from apps.credentials.models import resolve_platform_credentials
 from providers import get_provider
+from providers.exceptions import PublishError
 from providers.types import PostType, PublishContent
 
 from .models import PublishLog, RateLimitState
@@ -139,6 +140,12 @@ class PublishEngine:
             )
             .annotate(effective_at=Coalesce("scheduled_at", "post__scheduled_at"))
             .filter(effective_at__lte=now)
+            # A child waiting out a retry backoff is SCHEDULED too. Leave it to
+            # _process_retries once next_retry_at passes: picking it up here
+            # re-published on the very next poll tick and burned every retry
+            # within a minute of the first failure. NULL next_retry_at (never
+            # retried) still matches.
+            .exclude(next_retry_at__gt=now)
             # Never publish a post that has any platform on hold — a client hold
             # parks the whole post out of the publish path even if a sibling
             # platform is already scheduled.
@@ -349,6 +356,7 @@ class PublishEngine:
             attachments = [pm for pm in attachments if pm.media_asset.media_type == "video"]
 
         first_media_type = None
+        media_types: list[str] = []
         primary_video_duration = None
         app_url = getattr(settings, "APP_URL", "").rstrip("/")
         try:
@@ -359,6 +367,7 @@ class PublishEngine:
                 # Track the first media type for post type detection
                 if first_media_type is None:
                     first_media_type = asset.media_type
+                media_types.append(asset.media_type)
 
                 # Capture the first video's duration so providers can enforce
                 # platform max-duration limits (e.g. TikTok max_video_post_duration_sec).
@@ -448,6 +457,7 @@ class PublishEngine:
                 media_count=len(media_files),
                 first_media_type=first_media_type,
             )
+            self._validate_post_type_media(post_type, media_types)
 
             content = PublishContent(
                 text=platform_post.effective_caption or "",
@@ -524,10 +534,27 @@ class PublishEngine:
             return PostType.IMAGE
         return PostType.TEXT
 
+    @staticmethod
+    def _validate_post_type_media(post_type: PostType, media_types: list[str]) -> None:
+        """Fail fast (no retries) when the media can't produce the requested post type.
+
+        The composer enforces the same rules before scheduling; this guards
+        posts that reach the engine by other paths so a Reel hint with two
+        images isn't handed to the provider, which would publish only the
+        first item or reject the container after minutes of polling.
+        """
+        if post_type == PostType.REEL and media_types != ["video"]:
+            raise PublishError("Instagram Reels need exactly one video attached", retryable=False)
+        if post_type == PostType.STORY and (len(media_types) != 1 or media_types[0] not in ("image", "video")):
+            raise PublishError("Instagram Stories need exactly one image or video attached", retryable=False)
+
     def _fail_permanently(self, platform_post, error_msg, *, reason="non-retryable"):
         """Mark a post FAILED with no further retries."""
         platform_post.status = PlatformPost.Status.FAILED
         platform_post.publish_error = error_msg
+        # Clear the pending backoff so a manual reschedule of this row isn't
+        # held back by a stale future retry time (see _get_due_platform_posts).
+        platform_post.next_retry_at = None
         platform_post.save()
         logger.warning(
             "PlatformPost %s failed (%s): %s",

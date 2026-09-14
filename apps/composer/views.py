@@ -127,6 +127,26 @@ def _scoped_platform_post_ids(request, post):
     return list(post.platform_posts.filter(social_account_id=scope).values_list("id", flat=True))
 
 
+# Instagram (both the Facebook-login and Instagram-login providers) publishes a
+# post as a feed item unless the composer pins a post type. The values are the
+# ``PostType`` hints the publish engine reads from ``platform_extra``; feed is
+# represented by the key being absent.
+INSTAGRAM_PLATFORMS = ("instagram", "instagram_login")
+INSTAGRAM_POST_TYPES = ("reel", "story")
+INSTAGRAM_MAX_CAROUSEL_ITEMS = 10
+
+# Composer actions that put a post on the publish path or in front of a
+# reviewer. Drafts stay free-form.
+PUBLISH_BOUND_ACTIONS = (
+    "schedule",
+    "publish_now",
+    "add_to_queue",
+    "add_to_queue_priority",
+    "submit_for_approval",
+    "resubmit_for_approval",
+)
+
+
 def _sync_platform_posts(request, post, workspace, initial_status=None):
     """Sync platform post selections from form data.
 
@@ -221,6 +241,18 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
                     extra["video_cover_timestamp_ms"] = cover_ms_val
             pp.platform_extra = extra
 
+        elif account.platform in INSTAGRAM_PLATFORMS and f"ig_post_type_{acc_id}" in request.POST:
+            # Only touch the hint when the Instagram panel was part of the form
+            # (same reasoning as TikTok). Merge rather than replace: the engine
+            # stores the platform's publish response alongside these keys.
+            extra = dict(pp.platform_extra or {})
+            post_type = request.POST.get(f"ig_post_type_{acc_id}", "").strip()
+            if post_type in INSTAGRAM_POST_TYPES:
+                extra["post_type"] = post_type
+            else:
+                extra.pop("post_type", None)
+            pp.platform_extra = extra
+
         pp.save()
 
 
@@ -246,6 +278,85 @@ def _validate_pinterest_board_selection(request, post, workspace):
                 {"errors": {"pinterest_board": f"Select a Pinterest board for {account.account_name}."}},
                 status=400,
             )
+    return None
+
+
+def _instagram_media_types(request, post, workspace):
+    """Media types (in attachment order) the post will carry after this save.
+
+    Existing posts attach media directly (attach_media / upload_media); a
+    brand-new post holds its picks in the pending-media session list until
+    ``save_post`` attaches them.
+    """
+    from apps.media_library.models import MediaAsset
+
+    # Post.id carries a uuid4 default, so ``post.pk`` is set before the first
+    # save; ``_state.adding`` is the reliable "not in the database yet" signal.
+    if not post._state.adding:
+        return list(post.media_attachments.order_by("position").values_list("media_asset__media_type", flat=True))
+    pending_ids = _parse_media_asset_ids(",".join(request.session.get(f"pending_media_{workspace.id}", [])))
+    if not pending_ids:
+        return []
+    by_id = dict(MediaAsset.objects.filter(id__in=pending_ids, workspace=workspace).values_list("id", "media_type"))
+    keys = [uuid.UUID(pid) for pid in pending_ids]
+    return [by_id[key] for key in keys if key in by_id]
+
+
+def _instagram_media_error(post_type, media_types, account_name):
+    """Human message when ``media_types`` can't become ``post_type`` on Instagram, else None."""
+    count = len(media_types)
+    items = f"{count} item{'s' if count != 1 else ''} attached"
+    if post_type == "reel":
+        if media_types != ["video"]:
+            return f"Instagram Reels need exactly one video. {account_name} has {items}."
+        return None
+    if post_type == "story":
+        if count != 1 or media_types[0] not in ("image", "video"):
+            return f"Instagram Stories need exactly one image or video. {account_name} has {items}."
+        return None
+    if count == 0:
+        return f"Instagram posts need at least one image or video. {account_name} has none attached."
+    if count > INSTAGRAM_MAX_CAROUSEL_ITEMS:
+        return f"Instagram carousels can hold at most {INSTAGRAM_MAX_CAROUSEL_ITEMS} items. {account_name} has {items}."
+    return None
+
+
+def _validate_instagram_media(request, post, workspace):
+    """Reject a publish-bound save whose media can't produce the chosen Instagram post type.
+
+    Mirrors what Instagram enforces at publish time so the problem surfaces in
+    the composer instead of hours later in the worker: a Reel is exactly one
+    video, a Story exactly one image or video, a feed post needs media, and a
+    carousel holds at most ten items. Returns a 400 JsonResponse or None.
+    """
+    selected_ids = _parse_selected_account_ids(request.POST.get("selected_accounts", ""))
+    if not selected_ids:
+        return None
+    accounts = list(
+        SocialAccount.objects.filter(id__in=selected_ids, workspace=workspace, platform__in=INSTAGRAM_PLATFORMS)
+    )
+    if not accounts:
+        return None
+
+    media_types = _instagram_media_types(request, post, workspace)
+    for account in accounts:
+        field = f"ig_post_type_{account.id}"
+        if field in request.POST:
+            post_type = request.POST.get(field, "").strip()
+        elif not post._state.adding:
+            post_type = (
+                PlatformPost.objects.filter(post=post, social_account=account)
+                .values_list("platform_extra__post_type", flat=True)
+                .first()
+                or ""
+            )
+        else:
+            post_type = ""
+        if post_type not in INSTAGRAM_POST_TYPES:
+            post_type = ""
+        error = _instagram_media_error(post_type, media_types, account.account_name)
+        if error:
+            return JsonResponse({"errors": {"instagram_media": error}}, status=400)
     return None
 
 
@@ -770,6 +881,11 @@ def save_post(request, workspace_id, post_id=None):
     pinterest_board_error = _validate_pinterest_board_selection(request, post, workspace)
     if pinterest_board_error is not None:
         return pinterest_board_error
+
+    if action in PUBLISH_BOUND_ACTIONS:
+        instagram_media_error = _validate_instagram_media(request, post, workspace)
+        if instagram_media_error is not None:
+            return instagram_media_error
 
     # Handle action — note that Post itself no longer carries an editorial
     # status: every transition below operates on the PlatformPost children,

@@ -11,7 +11,7 @@ import time
 from datetime import datetime
 from urllib.parse import urlencode
 
-from .base import SocialProvider
+from .base import SocialProvider, is_video_url
 from .exceptions import APIError, OAuthError, PublishError
 from .meta_insights import fetch_insights_safe
 from .types import (
@@ -63,9 +63,12 @@ INSTAGRAM_MEDIA_FIELDS = [
     "comments_count",
 ]
 
-# Polling settings for container status checks
-CONTAINER_POLL_INTERVAL = 2  # seconds
-CONTAINER_POLL_MAX_ATTEMPTS = 60
+# Container status polling. Meta's guidance is to query a container roughly
+# once per minute for no more than five minutes. Polling every two seconds
+# across a multi-item carousel (and again on every retry) exhausted the app's
+# hourly request quota ("Application request limit reached", code 4).
+CONTAINER_POLL_INTERVAL = 10  # seconds
+CONTAINER_POLL_MAX_ATTEMPTS = 30  # ~5 minutes max
 
 
 class InstagramProvider(SocialProvider):
@@ -297,11 +300,10 @@ class InstagramProvider(SocialProvider):
             payload["media_type"] = "REELS"
             payload["video_url"] = content.media_urls[0]
         elif content.post_type == PostType.STORY:
-            if content.media_urls and content.media_urls[0].endswith((".mp4", ".mov")):
-                payload["media_type"] = "STORIES"
+            payload["media_type"] = "STORIES"
+            if is_video_url(content.media_urls[0]):
                 payload["video_url"] = content.media_urls[0]
             else:
-                payload["media_type"] = "STORIES"
                 payload["image_url"] = content.media_urls[0]
         else:
             # Default IMAGE
@@ -321,7 +323,7 @@ class InstagramProvider(SocialProvider):
         child_ids: list[str] = []
 
         for url in content.media_urls:
-            is_video = url.lower().endswith((".mp4", ".mov"))
+            is_video = is_video_url(url)
             child_payload: dict = {
                 "is_carousel_item": True,
             }

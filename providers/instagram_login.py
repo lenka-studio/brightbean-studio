@@ -18,7 +18,7 @@ import time
 from datetime import datetime
 from urllib.parse import urlencode
 
-from .base import SocialProvider
+from .base import SocialProvider, is_video_url
 from .exceptions import APIError, OAuthError, PublishError
 from .meta_insights import fetch_insights_safe
 from .types import (
@@ -71,9 +71,12 @@ INSTAGRAM_MEDIA_FIELDS = [
     "comments_count",
 ]
 
-# Container polling
-CONTAINER_POLL_INTERVAL = 2  # seconds
-CONTAINER_POLL_MAX_ATTEMPTS = 60  # ~2 minutes max
+# Container status polling. Meta's guidance is to query a container roughly
+# once per minute for no more than five minutes. Polling every two seconds
+# across a multi-item carousel (and again on every retry) exhausted the app's
+# hourly request quota ("Application request limit reached", code 4).
+CONTAINER_POLL_INTERVAL = 10  # seconds
+CONTAINER_POLL_MAX_ATTEMPTS = 30  # ~5 minutes max
 
 
 class InstagramLoginProvider(SocialProvider):
@@ -300,13 +303,18 @@ class InstagramLoginProvider(SocialProvider):
         if content.text:
             payload["caption"] = content.text
 
-        if content.post_type == PostType.REEL:
+        if content.post_type in (PostType.REEL, PostType.VIDEO):
+            # Instagram no longer supports standalone feed videos: a single
+            # video is published as a Reel. PostType.VIDEO (the engine's
+            # fallback for a lone video asset) must take the REELS path too,
+            # otherwise it falls through to the IMAGE branch and the .mp4 is
+            # sent as image_url ("The image format is not supported").
             payload["media_type"] = "REELS"
             payload["video_url"] = content.media_urls[0]
         elif content.post_type == PostType.STORY:
             url = content.media_urls[0]
             payload["media_type"] = "STORIES"
-            if url.lower().endswith((".mp4", ".mov")):
+            if is_video_url(url):
                 payload["video_url"] = url
             else:
                 payload["image_url"] = url
@@ -322,7 +330,7 @@ class InstagramLoginProvider(SocialProvider):
         child_ids: list[str] = []
 
         for url in content.media_urls:
-            is_video = url.lower().endswith((".mp4", ".mov"))
+            is_video = is_video_url(url)
             child_payload: dict = {"is_carousel_item": True}
             if is_video:
                 child_payload["media_type"] = "VIDEO"

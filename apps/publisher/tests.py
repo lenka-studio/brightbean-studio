@@ -393,3 +393,110 @@ class PublishedPostLeavesQueueTest(TestCase):
         self.assertEqual(self.pp.status, PlatformPost.Status.PUBLISHED)
         self.assertEqual(self.pp.retry_count, 0)
         self.assertIsNone(self.pp.next_retry_at)
+
+
+class RetryBackoffDueQueryTest(TestCase):
+    """The primary due-query must leave children that are waiting out a retry backoff alone."""
+
+    def setUp(self):
+        from apps.organizations.models import Organization
+        from apps.social_accounts.models import SocialAccount
+        from apps.workspaces.models import Workspace
+
+        self.org = Organization.objects.create(name="Org")
+        self.workspace = Workspace.objects.create(organization=self.org, name="WS")
+        self.account = SocialAccount.objects.create(
+            workspace=self.workspace,
+            platform="instagram_login",
+            account_platform_id="ig-1",
+            account_name="Lenka Studio",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+
+    def _child(self, **kwargs):
+        from datetime import timedelta
+
+        from apps.composer.models import PlatformPost, Post
+
+        post = Post.objects.create(workspace=self.workspace, caption="hi")
+        kwargs.setdefault("status", PlatformPost.Status.SCHEDULED)
+        kwargs.setdefault("scheduled_at", timezone.now() - timedelta(hours=1))
+        return PlatformPost.objects.create(post=post, social_account=self.account, **kwargs)
+
+    def test_due_query_skips_child_waiting_for_its_retry(self):
+        from datetime import timedelta
+
+        now = timezone.now()
+        waiting = self._child(retry_count=1, next_retry_at=now + timedelta(minutes=5))
+        ready = self._child(retry_count=1, next_retry_at=now - timedelta(minutes=1))
+        fresh = self._child()
+
+        due_ids = {pp.id for pp in PublishEngine()._get_due_platform_posts()}
+
+        self.assertNotIn(waiting.id, due_ids)
+        self.assertIn(ready.id, due_ids)
+        self.assertIn(fresh.id, due_ids)
+
+    def test_backoff_is_honoured_across_poll_ticks(self):
+        # Regression: a retryable failure re-published on the very next poll
+        # tick (6 s later instead of 60 s) because the due-query ignored
+        # next_retry_at, so all three retries were burned within a minute.
+        from apps.composer.models import PlatformPost
+        from providers.exceptions import PublishError
+
+        pp = self._child(status=PlatformPost.Status.PUBLISHING)
+        engine = PublishEngine()
+        with patch.object(PublishEngine, "_dispatch_to_provider", side_effect=PublishError("transient")):
+            engine._publish_platform_post(pp)
+        pp.refresh_from_db()
+        self.assertEqual(pp.status, PlatformPost.Status.SCHEDULED)
+        self.assertEqual(pp.retry_count, 1)
+
+        self.assertEqual([p.id for p in engine._get_due_platform_posts()], [])
+
+    def test_permanent_failure_clears_stale_retry_time(self):
+        from datetime import timedelta
+
+        from apps.composer.models import PlatformPost
+
+        pp = self._child(
+            status=PlatformPost.Status.PUBLISHING,
+            retry_count=MAX_RETRIES,
+            next_retry_at=timezone.now() + timedelta(minutes=30),
+        )
+        PublishEngine()._schedule_retry(pp, "still broken")
+        pp.refresh_from_db()
+        self.assertEqual(pp.status, PlatformPost.Status.FAILED)
+        self.assertIsNone(pp.next_retry_at)
+        # A manual reschedule of the failed row is therefore picked up right away.
+        pp.status = PlatformPost.Status.SCHEDULED
+        pp.save()
+        self.assertIn(pp.id, {p.id for p in PublishEngine()._get_due_platform_posts()})
+
+
+class PostTypeMediaValidationTest(SimpleTestCase):
+    """Reel/Story hints must match the attached media before anything is sent to Instagram."""
+
+    def test_reel_needs_exactly_one_video(self):
+        from providers.exceptions import PublishError
+
+        PublishEngine._validate_post_type_media(PostType.REEL, ["video"])
+        for media in ([], ["image"], ["video", "image"], ["video", "video"]):
+            with self.assertRaises(PublishError) as ctx:
+                PublishEngine._validate_post_type_media(PostType.REEL, media)
+            self.assertFalse(ctx.exception.retryable)
+
+    def test_story_needs_one_image_or_video(self):
+        from providers.exceptions import PublishError
+
+        PublishEngine._validate_post_type_media(PostType.STORY, ["image"])
+        PublishEngine._validate_post_type_media(PostType.STORY, ["video"])
+        for media in ([], ["gif"], ["image", "image"]):
+            with self.assertRaises(PublishError) as ctx:
+                PublishEngine._validate_post_type_media(PostType.STORY, media)
+            self.assertFalse(ctx.exception.retryable)
+
+    def test_other_post_types_are_not_constrained(self):
+        for post_type in (PostType.IMAGE, PostType.VIDEO, PostType.CAROUSEL, PostType.TEXT):
+            PublishEngine._validate_post_type_media(post_type, ["image", "video"])
+            PublishEngine._validate_post_type_media(post_type, [])
