@@ -20,12 +20,18 @@ from django.views.decorators.http import require_GET, require_POST
 from django_ratelimit.decorators import ratelimit
 
 from apps.common.validators import is_safe_url as _is_safe_url
-from apps.credentials.models import PlatformCredential, resolve_platform_credentials
+from apps.credentials.models import PlatformCredential, derive_is_configured
 from apps.members.decorators import require_permission
 
 from .models import MastodonAppRegistration, PlatformVisibility, SocialAccount
 from .oauth_aliases import from_url_slug, redirect_uri_from_request, to_url_slug
 from .oauth_pkce import issue_pkce_verifier, pkce_kwargs
+from .provider_factory import _get_provider_for_platform, apply_analytics_scope_flag
+from .webhooks import (
+    subscribe_account_webhooks,
+    subscribe_account_webhooks_task,
+    unsubscribe_account_webhooks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,42 +39,12 @@ OAUTH_STATE_MAX_AGE = 600  # 10 minutes
 OAUTH_SESSION_KEY = "social_oauth"
 
 
-def _get_provider_for_platform(platform: str, org_id, **extra_credentials):
-    """Resolve app credentials and instantiate the provider."""
-    from providers import get_provider
-
-    # .env is dominant; admin-entered org credentials are the fallback.
-    credentials = resolve_platform_credentials(platform, org_id)
-
-    if extra_credentials:
-        credentials = {**credentials, **extra_credentials}
-
-    return get_provider(platform, credentials)
-
-
 def _get_visible_platform_choices():
     """Return PlatformCredential.Platform.choices filtered to visible platforms.
 
     Platforms without a PlatformVisibility row default to visible.
     """
-    hidden = set(PlatformVisibility.objects.filter(is_visible=False).values_list("platform", flat=True))
-    return [(value, label) for value, label in PlatformCredential.Platform.choices if value not in hidden]
-
-
-def _apply_analytics_scope_flag(provider, platform):
-    """Set ``provider.include_analytics_scopes`` based on AnalyticsPlatformConfig.
-
-    Providers add their analytics-only scopes (e.g. ``read_insights``,
-    ``yt-analytics.readonly``) to the OAuth scope list only when this flag is
-    True. If the platform is disabled in ``AnalyticsPlatformConfig`` (analytics
-    not yet rolled out for it), we omit those scopes so a self-hoster whose
-    Meta / TikTok / Google app hasn't been approved for them can still connect
-    accounts for publishing.
-    """
-    from apps.social_accounts.models import AnalyticsPlatformConfig
-
-    enabled = AnalyticsPlatformConfig.enabled_platforms()
-    provider.include_analytics_scopes = platform in enabled
+    return PlatformVisibility.visible_choices()
 
 
 def _get_configured_platforms(org_id):
@@ -81,7 +57,12 @@ def _get_configured_platforms(org_id):
     )
     env_creds = getattr(settings, "PLATFORM_CREDENTIALS_FROM_ENV", {})
     for platform, creds in env_creds.items():
-        if any(v for v in creds.values()):
+        # Same completeness rule the credential resolver applies, so the grid can
+        # never offer a Connect button that resolution will reject. A truthiness
+        # check here would let a half-filled pair (app id set, secret missing)
+        # render as connectable, walk the user through the platform's consent
+        # screen, and only fail at token exchange with a generic error.
+        if derive_is_configured(platform, creds):
             configured.add(platform)
 
     # Session-auth platforms (e.g. Bluesky) don't need app-level credentials —
@@ -260,7 +241,7 @@ def connect_platform(request, workspace_id):
 
     # Standard OAuth flow
     provider = _get_provider_for_platform(platform, request.org.id)
-    _apply_analytics_scope_flag(provider, platform)
+    apply_analytics_scope_flag(provider, platform)
     nonce = secrets.token_urlsafe(32)
     state = _sign_state(workspace_id, platform, request.user.id, nonce)
 
@@ -479,9 +460,7 @@ def select_account(request):
 
     for page in page_data["pages"]:
         if page["id"] in selected_ids:
-            access_token = page.get("access_token")
-            if not access_token and platform == "instagram":
-                access_token = user_tokens["access_token"]
+            access_token = resolve_page_account_token(page, platform, user_tokens.get("access_token", ""))
             if not access_token:
                 messages.error(
                     request,
@@ -503,6 +482,9 @@ def select_account(request):
                 access_token=access_token,
                 refresh_token=user_tokens.get("refresh_token"),
                 expires_in=None,
+                # Instagram-via-Facebook receives its webhooks through the
+                # linked Page, so remember which Page to subscribe.
+                webhook_target_id=page.get("page_id", ""),
             )
             connected.append(page["name"])
 
@@ -736,7 +718,7 @@ def reconnect(request, workspace_id, account_id):
 
     # Standard OAuth reconnect
     provider = _get_provider_for_platform(platform, request.org.id)
-    _apply_analytics_scope_flag(provider, platform)
+    apply_analytics_scope_flag(provider, platform)
     nonce = secrets.token_urlsafe(32)
     state = _sign_state(workspace_id, platform, request.user.id, nonce)
     code_verifier = issue_pkce_verifier(provider)
@@ -753,6 +735,63 @@ def reconnect(request, workspace_id, account_id):
     return redirect(auth_url)
 
 
+@login_required
+@require_permission("manage_social_accounts")
+@require_POST
+@ratelimit(key="user", rate="10/m", method="POST", block=True)
+def retry_webhooks(request, workspace_id, account_id):
+    """Re-run a failed webhook subscription without a new OAuth grant.
+
+    A subscription can fail for reasons that have nothing to do with the token —
+    a transient Graph error, or a bug in what we asked for — and sending the
+    user through the full OAuth dance to retry one API call is theatre. Runs
+    inline rather than through ``subscribe_account_webhooks_task``: that task
+    exists so connecting *several* Pages at once doesn't stack a round trip per
+    Page inside the redirect the user is waiting on, which a single deliberate
+    retry doesn't. Rate limited because each press is a live round trip to the
+    platform on a request thread.
+    """
+    account = get_object_or_404(SocialAccount.objects.for_workspace(workspace_id), id=account_id)
+
+    # A dead connection cannot carry a subscription: the call would spend a
+    # round trip to be rejected, then overwrite the warning with one about
+    # real-time delivery when the real problem is the connection itself. Gated
+    # on the same ``needs_reconnect`` the card uses to hide the retry button, so
+    # this can only be reached by a stale card or a direct POST — and answers
+    # both with the reconnect state rather than an unchanged card.
+    if account.needs_reconnect:
+        if request.headers.get("HX-Request"):
+            return _render_account_card(request, account, workspace_id)
+        messages.error(request, f"Reconnect {account.display_label} first — its connection isn't healthy.")
+        return redirect("social_accounts:list", workspace_id=workspace_id)
+
+    # An explicit press is a fresh mandate: clear the automatic retry budget so
+    # a user can always get one more attempt out of a capped-out account.
+    SocialAccount.objects.filter(pk=account.pk).update(webhook_retry_count=0)
+    account.webhook_retry_count = 0
+
+    subscribed = subscribe_account_webhooks(account)
+    account.refresh_from_db()
+
+    if request.headers.get("HX-Request"):
+        return _render_account_card(request, account, workspace_id)
+
+    if subscribed:
+        messages.success(request, f"Real-time updates are back on for {account.display_label}.")
+    else:
+        messages.error(request, account.webhook_error or "Couldn't set up real-time updates. Please try again.")
+    return redirect("social_accounts:list", workspace_id=workspace_id)
+
+
+def _render_account_card(request, account, workspace_id):
+    """Render one account card for an htmx ``outerHTML`` swap of ``#account-<id>``."""
+    return render(
+        request,
+        "social_accounts/partials/_account_card.html",
+        {"account": account, "workspace_id": workspace_id},
+    )
+
+
 # ------------------------------------------------------------------
 # Disconnect
 # ------------------------------------------------------------------
@@ -764,6 +803,11 @@ def reconnect(request, workspace_id, account_id):
 def disconnect(request, workspace_id, account_id):
     """Disconnect a social account."""
     account = get_object_or_404(SocialAccount.objects.for_workspace(workspace_id), id=account_id)
+
+    # Stop the platform pushing us this account's activity before we drop the
+    # token that would let us unsubscribe.
+    if account.oauth_access_token:
+        unsubscribe_account_webhooks(account)
 
     # Try to revoke token
     try:
@@ -809,6 +853,26 @@ def disconnect(request, workspace_id, account_id):
 # ------------------------------------------------------------------
 
 
+def resolve_page_account_token(page: dict, platform: str, user_access_token: str) -> str:
+    """Pick the token a Page-backed account must be driven by.
+
+    A Facebook Page needs its *own* Page token: a user token publishes under
+    the wrong identity, and — because the only revoke endpoint that accepts it
+    revokes the app for the whole person — makes a per-account disconnect able
+    to sever every other connection they have.
+
+    Instagram-via-Facebook is the one exception: its calls address the IG user,
+    so the user token is the correct credential when the Page dict carries none.
+
+    Returns "" when no usable token exists, which callers must treat as "cannot
+    connect this account" rather than substituting one.
+    """
+    token = page.get("access_token")
+    if not token and platform == PlatformCredential.Platform.INSTAGRAM:
+        token = user_access_token
+    return token or ""
+
+
 def _create_or_update_account(
     *,
     workspace_id,
@@ -818,6 +882,7 @@ def _create_or_update_account(
     refresh_token=None,
     expires_in=None,
     instance_url="",
+    webhook_target_id="",
 ):
     """Create or update a SocialAccount from OAuth results."""
     token_expires_at = None
@@ -837,10 +902,21 @@ def _create_or_update_account(
             "oauth_refresh_token": refresh_token or "",
             "token_expires_at": token_expires_at,
             "instance_url": instance_url,
+            "webhook_target_id": webhook_target_id or "",
             "connection_status": SocialAccount.ConnectionStatus.CONNECTED,
             "last_error": "",
             # Fresh OAuth grant invalidates any prior analytics-scope failure.
             "analytics_needs_reconnect": False,
+            # Likewise the webhook verdict: the subscription is about to be
+            # retried below, and subscribe_account_webhooks returns early
+            # without recording when the provider has no webhooks at all — so
+            # without this reset a stale failure would outlive the reconnect
+            # that was supposed to clear it.
+            "webhooks_active": None,
+            "webhook_error": "",
+            "webhook_needs_reconnect": False,
+            "webhook_error_detail": "",
+            "webhook_retry_count": 0,
         },
     )
 
@@ -848,5 +924,7 @@ def _create_or_update_account(
         from apps.calendar.services import create_default_queue_and_slots
 
         create_default_queue_and_slots(account)
+
+    subscribe_account_webhooks_task(str(account.id))
 
     return account

@@ -378,6 +378,24 @@
                 </div>
                 {% endif %}
 
+                {% if failed_first_comments %}
+                <!-- The post itself published; only the first comment failed. Say so
+                     explicitly, or a post with a missing comment looks fully successful. -->
+                <div class="border border-amber-200 bg-amber-50 rounded-xl p-3 space-y-1.5">
+                    <div class="flex items-center gap-1.5 text-xs font-semibold text-amber-800">
+                        <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+                        First comment not posted
+                    </div>
+                    {% for pp in failed_first_comments %}
+                    <p class="text-xs text-amber-700 pl-5.5">
+                        <span class="font-semibold">{{ pp.social_account.account_name|default:pp.social_account.account_handle }}:</span>
+                        {{ pp.first_comment_error|default:"The first comment couldn't be added. Add it manually on the post." }}
+                    </p>
+                    {% endfor %}
+                    <p class="text-[11px] text-amber-600 pl-5.5">The post itself published successfully — only the comment failed.</p>
+                </div>
+                {% endif %}
+
                 {% if post and post.status == 'scheduled' %}
                 <!-- Scheduled: editable, but warn that edits affect a live schedule -->
                 <div class="border border-amber-200 bg-amber-50 rounded-xl p-3 flex items-start gap-2">
@@ -522,8 +540,8 @@
                                 Media Library
                             </button>
                             <span class="text-xs tabular-nums font-medium"
-                                  :class="(() => { const min = Math.min(...selectedAccounts.map(id => charLimits[id]?.limit || 9999)); return caption.length > min ? 'text-red-500' : 'text-stone-400'; })()"
-                                  x-text="(() => { const limits = selectedAccounts.map(id => charLimits[id]?.limit).filter(Boolean); const min = limits.length ? Math.min(...limits) : null; return min ? caption.length + ' / ' + min : caption.length; })()">
+                                  :class="captionOverLimit() ? 'text-red-500' : 'text-stone-400'"
+                                  x-text="captionLimit() ? captionCount() + ' / ' + captionLimit() : captionCount()">
                             </span>
                         </div>
                     </div>
@@ -2037,6 +2055,46 @@ function composerApp() {
         // Declared here so scoped writes (inside x-for panels) hit this
         // component instead of the iteration scope.
         _filmstripRun: 0,
+
+        // Caption length as a platform counts it. LinkedIn escapes reserved
+        // characters in what it publishes, so each one costs two against the
+        // limit — mirrors providers.caption_wire_length on the server.
+        wireLength(text, accId) {
+            const escaped = this.charLimits[accId]?.escaped_chars || '';
+            if (!escaped) return text.length;
+            let extra = 0;
+            for (const ch of text) {
+                if (escaped.includes(ch)) extra++;
+            }
+            return text.length + extra;
+        },
+        // The counter shows one account: the one with the least headroom. Both
+        // numbers have to come from the same account or the pair lies — 200 '#'
+        // on LinkedIn and Bluesky would read as 400 / 300 (LinkedIn's escaped
+        // count against Bluesky's limit) with nothing actually over.
+        captionBinding() {
+            let binding = null;
+            for (const id of this.selectedAccounts) {
+                const limit = this.charLimits[id]?.limit;
+                if (!limit) continue;
+                const count = this.wireLength(this.caption, id);
+                if (binding === null || limit - count < binding.limit - binding.count) {
+                    binding = { count, limit };
+                }
+            }
+            return binding;
+        },
+        captionCount() {
+            return this.captionBinding()?.count ?? this.caption.length;
+        },
+        captionLimit() {
+            return this.captionBinding()?.limit ?? null;
+        },
+        // The least-headroom account is over exactly when any account is.
+        captionOverLimit() {
+            const binding = this.captionBinding();
+            return binding !== null && binding.count > binding.limit;
+        },
 
         // Computed-like getters for title field visibility
         get anyPlatformNeedsTitle() {

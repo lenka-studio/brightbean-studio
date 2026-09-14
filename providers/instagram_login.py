@@ -19,8 +19,14 @@ from datetime import datetime
 from urllib.parse import urlencode
 
 from .base import SocialProvider, is_video_url
-from .exceptions import APIError, OAuthError, PublishError
+from .exceptions import APIError, OAuthError, ProviderError, PublishError
+from .meta_comments import (
+    fetch_instagram_comments,
+    find_own_instagram_comment,
+    resolve_comment_reply_target,
+)
 from .meta_insights import fetch_insights_safe
+from .meta_messaging import build_send_payload, resolve_recipient_id
 from .types import (
     AccountMetrics,
     AccountProfile,
@@ -43,6 +49,8 @@ AUTH_URL = "https://www.instagram.com/oauth/authorize"
 TOKEN_URL = "https://api.instagram.com/oauth/access_token"
 GRAPH_HOST = "https://graph.instagram.com"
 API_BASE = f"{GRAPH_HOST}/v25.0"
+# Subscribed on the Instagram account itself — this flow has no Facebook Page.
+INSTAGRAM_LOGIN_WEBHOOK_FIELDS = ["comments", "messages"]
 INSTAGRAM_ACCOUNT_INSIGHTS = [
     "reach",
     "views",
@@ -121,21 +129,22 @@ class InstagramLoginProvider(SocialProvider):
 
     @property
     def required_scopes(self) -> list[str]:
-        scopes = [
+        return [
             "instagram_business_basic",
             "instagram_business_content_publish",
             "instagram_business_manage_comments",
             "instagram_business_manage_messages",
+            # Required for the `/insights` endpoints, and requested
+            # unconditionally rather than through ``analytics_only_scopes``.
+            # An OAuth grant is frozen at connect time while the
+            # AnalyticsPlatformConfig toggle it was gated on can flip
+            # afterwards, so gating it minted tokens that could never read
+            # insights once analytics was switched on — the account had to be
+            # reconnected, with nothing but an empty page to say so. Mirrors
+            # providers/instagram.py, which has always asked for
+            # instagram_manage_insights on the Facebook-Page path.
+            "instagram_business_manage_insights",
         ]
-        if self.include_analytics_scopes:
-            scopes.extend(self.analytics_only_scopes)
-        return scopes
-
-    @property
-    def analytics_only_scopes(self) -> list[str]:
-        # Required for `/insights` endpoints on the IG-Login OAuth path.
-        # Only requested when analytics is enabled in AnalyticsPlatformConfig.
-        return ["instagram_business_manage_insights"]
 
     @property
     def rate_limits(self) -> RateLimitConfig:
@@ -418,6 +427,9 @@ class InstagramLoginProvider(SocialProvider):
     # ------------------------------------------------------------------
 
     def publish_comment(self, access_token: str, post_id: str, text: str) -> CommentResult:
+        # No ``fields`` param — see InstagramProvider.publish_comment: Meta
+        # creates the comment and *then* rejects the response format, so the
+        # retry queue duplicates it.
         resp = self._request(
             "POST",
             f"{API_BASE}/{post_id}/comments",
@@ -426,6 +438,22 @@ class InstagramLoginProvider(SocialProvider):
         )
         data = resp.json()
         return CommentResult(platform_comment_id=data["id"], extra=data)
+
+    def find_own_comment(self, access_token: str, post_id: str, text: str) -> str | None:
+        """Find a comment this account already left on ``post_id``.
+
+        Reconciliation before retrying a first comment — see
+        ``InstagramProvider.find_own_comment``.
+        """
+        return find_own_instagram_comment(
+            self._request,
+            api_base=API_BASE,
+            access_token=access_token,
+            media_id=post_id,
+            text=text,
+            own_id=str(self.credentials.get("ig_user_id") or ""),
+            own_handle=str(self.credentials.get("account_handle") or ""),
+        )
 
     # ------------------------------------------------------------------
     # Analytics
@@ -502,6 +530,47 @@ class InstagramLoginProvider(SocialProvider):
     # ------------------------------------------------------------------
 
     def get_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
+        """Poll DMs and comments, letting either half fail on its own.
+
+        The two need different permissions —
+        ``instagram_business_manage_messages`` and
+        ``instagram_business_manage_comments`` — so an account granted only one
+        of them must still get the half it can read. Only a poll that produced
+        nothing at all reports failure upward.
+        """
+        messages: list[InboxMessage] = []
+        failures: list[Exception] = []
+
+        for label, fetch in (("DM", self._fetch_direct_messages), ("comment", self._fetch_media_comments)):
+            try:
+                messages.extend(fetch(access_token, since))
+            except Exception as exc:
+                failures.append(exc)
+                logger.warning("Instagram Login %s poll failed: %s", label, exc)
+
+        if failures and not messages:
+            raise failures[0]
+        return messages
+
+    def _fetch_media_comments(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
+        """Poll comments on the account's recent media.
+
+        The ``comments`` webhook is the fast path, but an account whose
+        subscription never took would otherwise never see a comment and have no
+        way to backfill.
+        """
+        return fetch_instagram_comments(
+            self._request,
+            platform=self.platform_name,
+            host=API_BASE,
+            media_url=f"{API_BASE}/me/media",
+            access_token=access_token,
+            since=since,
+            owner_id=str(self.credentials.get("ig_user_id") or ""),
+            owner_handle=str(self.credentials.get("account_handle") or ""),
+        )
+
+    def _fetch_direct_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
         params: dict = {"fields": "id,participants,messages{id,message,from,created_time}"}
         if since:
             params["since"] = int(since.timestamp())
@@ -514,33 +583,105 @@ class InstagramLoginProvider(SocialProvider):
         )
         conversations = resp.json().get("data", [])
 
+        own_id = str(self.credentials.get("ig_user_id", ""))
+
         messages: list[InboxMessage] = []
         for convo in conversations:
             for msg in convo.get("messages", {}).get("data", []):
                 sender = msg.get("from", {})
+                sender_id = str(sender.get("id", ""))
+                # A conversation contains both sides. Without this the account's
+                # own replies come back on the next poll as fresh inbound DMs,
+                # re-notifying the team and restarting their SLA clock.
+                if own_id and sender_id == own_id:
+                    continue
                 messages.append(
                     InboxMessage(
                         platform_message_id=msg["id"],
-                        sender_id=sender.get("id", ""),
+                        sender_id=sender_id,
                         sender_name=sender.get("name", sender.get("username", "")),
                         text=msg.get("message", ""),
                         timestamp=datetime.fromisoformat(msg["created_time"].replace("+0000", "+00:00")),
                         message_type="dm",
-                        extra={"conversation_id": convo["id"]},
+                        # sender_id is the IGSID the messaging endpoint replies to.
+                        extra={"conversation_id": convo["id"], "sender_id": sender_id},
                     )
                 )
         return messages
 
-    def reply_to_message(self, access_token: str, message_id: str, text: str, extra: dict | None = None) -> ReplyResult:
-        """Reply to a conversation. message_id should be the conversation ID."""
+    def reply_to_message(
+        self,
+        access_token: str,
+        message_id: str,
+        text: str,
+        extra: dict | None = None,
+        *,
+        human_agent: bool = False,
+    ) -> ReplyResult:
+        """Send a DM reply addressed to the sender's IGSID."""
+        igsid = resolve_recipient_id(extra)
+        if not igsid:
+            raise APIError(
+                "Cannot send the reply: no Instagram-scoped ID for the recipient. "
+                "The original message is missing its sender details.",
+                platform=self.platform_name,
+            )
+
+        payload = build_send_payload(igsid, text, human_agent=human_agent)
+
         resp = self._request(
             "POST",
-            f"{API_BASE}/{message_id}/messages",
+            f"{API_BASE}/me/messages",
+            access_token=access_token,
+            json=payload,
+        )
+        data = resp.json()
+        return ReplyResult(platform_message_id=data.get("message_id", ""), extra=data)
+
+    def reply_to_comment(self, access_token: str, comment_id: str, text: str, extra: dict | None = None) -> ReplyResult:
+        """Reply to a comment, or comment on a media item.
+
+        A comment is answered on its ``replies`` edge, but a mention in a
+        caption gives us only the media ID, which has no ``replies`` edge —
+        that one is answered by commenting on the media itself. The inbox
+        records which applies as ``reply_edge``.
+        """
+        target, edge = resolve_comment_reply_target(comment_id, extra)
+        resp = self._request(
+            "POST",
+            f"{API_BASE}/{target}/{edge}",
             access_token=access_token,
             json={"message": text},
         )
         data = resp.json()
         return ReplyResult(platform_message_id=data.get("id", ""), extra=data)
+
+    # ------------------------------------------------------------------
+    # Webhooks
+    # ------------------------------------------------------------------
+
+    def subscribe_webhooks(self, access_token: str, account_id: str) -> bool:
+        """Subscribe this app to the Instagram account's webhooks.
+
+        The Instagram-login path subscribes the IG account directly — there is
+        no Facebook Page in this flow — so ``account_id`` is unused and we
+        address ``me`` with the account's own token.
+        """
+        resp = self._request(
+            "POST",
+            f"{API_BASE}/me/subscribed_apps",
+            access_token=access_token,
+            params={"subscribed_fields": ",".join(INSTAGRAM_LOGIN_WEBHOOK_FIELDS)},
+        )
+        return bool(resp.json().get("success"))
+
+    def unsubscribe_webhooks(self, access_token: str, account_id: str) -> bool:
+        resp = self._request(
+            "DELETE",
+            f"{API_BASE}/me/subscribed_apps",
+            access_token=access_token,
+        )
+        return bool(resp.json().get("success"))
 
     def _get_profile_fields(self, access_token: str) -> dict | None:
         # Returns ``None`` on failure so callers can distinguish a failed fetch
@@ -573,6 +714,13 @@ class InstagramLoginProvider(SocialProvider):
     # ------------------------------------------------------------------
 
     def revoke_token(self, access_token: str) -> bool:
+        """Revoke this app's grant on the connected Instagram account.
+
+        Safe to do per-account here, unlike the Facebook-Page providers: this
+        flow's token belongs to the Instagram account itself, so revoking it
+        severs nothing else. It also restores the full permission dialog on the
+        next connect, rather than the abbreviated "continue sharing?" prompt.
+        """
         try:
             self._request(
                 "DELETE",
@@ -580,6 +728,9 @@ class InstagramLoginProvider(SocialProvider):
                 access_token=access_token,
             )
             return True
-        except APIError:
+        except ProviderError:
+            # Not just APIError: a 429 raises RateLimitError and an expired
+            # grant raises TokenExpiredError, neither of which subclasses it.
+            # Disconnect must proceed regardless of why revocation failed.
             logger.warning("Failed to revoke Instagram token")
             return False

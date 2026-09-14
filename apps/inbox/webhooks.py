@@ -159,7 +159,13 @@ def instagram_login_webhook(request):
 
 
 def _handle_facebook_change(account, change: dict):
-    """Handle a single Facebook change event (comment, mention, etc.)."""
+    """Handle a single change event from a Page or Instagram subscription.
+
+    Facebook and Instagram name and shape these differently: a Page sends
+    ``feed``/``mention`` with the body under ``message``, while Instagram sends
+    ``comments``/``mentions`` with the body under ``text`` and the author's
+    ``username`` in place of a name.
+    """
     field = change.get("field", "")
     value = change.get("value", {})
 
@@ -167,16 +173,138 @@ def _handle_facebook_change(account, change: dict):
         _upsert_facebook_comment(account, value)
     elif field == "mention":
         _upsert_facebook_mention(account, value)
+    elif field == "comments":
+        _upsert_instagram_comment(account, value)
+    elif field == "mentions":
+        _upsert_instagram_mention(account, value)
+
+
+def _is_own_activity(account, from_data: dict) -> bool:
+    """True when the account itself authored this item.
+
+    Replying from the inbox posts a real comment, which the platform then sends
+    straight back to us as a new event. Without this guard a team's own answers
+    reappear as fresh customer comments, notify everyone again, and start an SLA
+    clock on themselves.
+    """
+    author_id = str((from_data or {}).get("id") or "")
+    if not author_id:
+        return False
+    return author_id in {
+        str(account.account_platform_id),
+        str(account.webhook_target_id or ""),
+    }
+
+
+# The ``feed`` field carries every change to a Page's timeline, not just
+# comments: reactions, shares, the Page's own posts, edits and deletions all
+# arrive on it. ``item`` says what changed and ``verb`` says how. A reaction on
+# a comment carries ``comment_id`` too, so without this gate it lands in the
+# inbox as an empty-bodied "comment".
+FACEBOOK_FEED_ADD_VERBS = {"add"}
+FACEBOOK_FEED_EDIT_VERBS = {"edit", "edited"}
+FACEBOOK_FEED_REMOVE_VERBS = {"remove", "hide", "block", "mute"}
+
+
+def _facebook_comment_extra(value: dict) -> dict:
+    """Normalize a feed comment payload into the shape the inbox expects.
+
+    Two normalizations matter downstream:
+
+    * ``stored_post_id`` matches ``PlatformPost.platform_post_id`` so
+      ``related_post`` links, exactly as the poll path produces it.
+    * ``parent_id`` is dropped when it names the post rather than a parent
+      *comment*. Facebook reports the post id there for every top-level
+      comment, and ``reply_to_comment`` would then answer on the post's own
+      edge — publishing a new top-level comment instead of a threaded reply.
+    """
+    from providers.facebook import FacebookProvider
+
+    post_id = str(value.get("post_id", ""))
+    extra = {
+        **value,
+        "stored_post_id": FacebookProvider._stored_post_id(post_id),
+        "source": "webhook",
+    }
+    parent_id = str(value.get("parent_id") or "")
+    if parent_id and parent_id in {post_id, extra["stored_post_id"]}:
+        extra.pop("parent_id", None)
+    return extra
+
+
+def _instagram_comment_extra(value: dict, *, reply_edge: str) -> dict:
+    """Normalize an Instagram comment or mention payload for the inbox.
+
+    Instagram nests the media under ``value["media"]["id"]`` (flat ``media_id``
+    on a mention) where a Page sends a flat ``post_id``. ``_related_post_key``
+    only reads ``stored_post_id``/``post_id``, so without this every Instagram
+    comment stores a NULL related_post even though PlatformPost holds that exact
+    media id — Instagram ids carry no page prefix to strip, so the two match
+    directly and both keys are the same value.
+    """
+    media_id = str((value.get("media") or {}).get("id") or value.get("media_id") or "")
+    extra = {**value, "reply_edge": reply_edge, "source": "webhook"}
+    if media_id:
+        extra["post_id"] = media_id
+        extra["stored_post_id"] = media_id
+    # A parent_id naming the media or the comment itself is not a parent
+    # *comment*; replying on it would publish a new top-level comment instead of
+    # a threaded reply.
+    parent_id = str(value.get("parent_id") or "")
+    if parent_id and parent_id not in {str(value.get("id") or ""), media_id}:
+        extra["parent_id"] = parent_id
+    else:
+        extra.pop("parent_id", None)
+    return extra
 
 
 def _upsert_facebook_comment(account, value: dict):
     """Upsert a Facebook comment from a webhook event."""
+    # Both default leniently: an older or variant payload shape that omits them
+    # is still a comment being added, which is how this used to behave.
+    if value.get("item", "comment") != "comment":
+        return
+
     comment_id = value.get("comment_id") or value.get("id")
     if not comment_id:
         return
 
+    verb = value.get("verb", "add")
+    if verb in FACEBOOK_FEED_REMOVE_VERBS:
+        # A deleted or hidden comment should stop its SLA clock rather than
+        # sit in the inbox waiting for a reply that can no longer be posted.
+        InboxMessage.objects.filter(
+            social_account=account,
+            platform_message_id=str(comment_id),
+        ).update(status=InboxMessage.Status.ARCHIVED)
+        return
+    if verb not in FACEBOOK_FEED_ADD_VERBS | FACEBOOK_FEED_EDIT_VERBS:
+        logger.debug("Ignoring Facebook feed comment event with verb %r", verb)
+        return
+
     from_data = value.get("from", {})
+    if _is_own_activity(account, from_data):
+        return
+
     text = value.get("message", "")
+    extra = _facebook_comment_extra(value)
+
+    if verb in FACEBOOK_FEED_EDIT_VERBS:
+        # An edit of a comment we already hold must replace the stored text, or
+        # the team answers wording the customer has already taken back. Falls
+        # through to the create path when we have never seen the comment.
+        existing = InboxMessage.objects.filter(
+            social_account=account,
+            platform_message_id=str(comment_id),
+        )
+        if existing.update(body=text, extra=extra):
+            # Re-classify only rows we classified ourselves. A human who set the
+            # sentiment by hand outranks the classifier, and silently recomputing
+            # it would also leave sentiment_source claiming "manual".
+            existing.filter(sentiment_source=InboxMessage.SentimentSource.AUTO).update(
+                sentiment=analyze_sentiment(text)
+            )
+            return
 
     _create_if_new(
         account=account,
@@ -185,7 +313,7 @@ def _upsert_facebook_comment(account, value: dict):
         sender_name=from_data.get("name", "Unknown"),
         sender_id=from_data.get("id", ""),
         body=text,
-        extra=value,
+        extra=extra,
     )
 
 
@@ -205,7 +333,61 @@ def _upsert_facebook_mention(account, value: dict):
         sender_name=from_data.get("name", "Unknown"),
         sender_id=from_data.get("id", ""),
         body=text,
-        extra=value,
+        # Same normalization as comments: without ``stored_post_id`` the
+        # related_post lookup compares a page-scoped id against the stripped
+        # form PlatformPost stores and can only ever miss.
+        extra=_facebook_comment_extra(value),
+    )
+
+
+def _upsert_instagram_comment(account, value: dict):
+    """Upsert an Instagram comment from a webhook event."""
+    comment_id = value.get("id")
+    if not comment_id:
+        return
+
+    from_data = value.get("from", {})
+    if _is_own_activity(account, from_data):
+        return
+
+    _create_if_new(
+        account=account,
+        platform_message_id=str(comment_id),
+        message_type=InboxMessage.MessageType.COMMENT,
+        sender_name=from_data.get("username", "Unknown"),
+        sender_id=from_data.get("id", ""),
+        body=value.get("text", ""),
+        extra=_instagram_comment_extra(value, reply_edge="comment"),
+    )
+
+
+# Instagram's mention payload carries only IDs, never the text, so the inbox
+# item is a pointer rather than a quote of what was said.
+INSTAGRAM_MENTION_PLACEHOLDER = "You were mentioned on Instagram. Open the post to read the mention."
+
+
+def _upsert_instagram_mention(account, value: dict):
+    """Upsert an Instagram mention from a webhook event.
+
+    A mention arrives either on a comment (``comment_id``) or in a media
+    caption (``media_id`` only). The two are answered on different edges, so
+    record which one applies — replying to a caption mention on the comment
+    ``replies`` edge fails.
+    """
+    comment_id = value.get("comment_id")
+    media_id = value.get("media_id")
+    mention_id = comment_id or media_id
+    if not mention_id:
+        return
+
+    _create_if_new(
+        account=account,
+        platform_message_id=str(mention_id),
+        message_type=InboxMessage.MessageType.MENTION,
+        sender_name="Instagram",
+        sender_id="",
+        body=INSTAGRAM_MENTION_PLACEHOLDER,
+        extra=_instagram_comment_extra(value, reply_edge="comment" if comment_id else "media"),
     )
 
 
@@ -242,19 +424,36 @@ def _create_if_new(
     """Create InboxMessage if it doesn't already exist (deduplication)."""
     from django.utils import timezone
 
+    from .tasks import _related_post_key
+
+    defaults = {
+        "workspace": account.workspace,
+        "message_type": message_type,
+        "sender_name": sender_name,
+        "sender_handle": sender_id,  # Platform user ID as fallback handle
+        "body": body,
+        "sentiment": analyze_sentiment(body),
+        "extra": extra,
+        "received_at": timezone.now(),
+    }
+
+    # Link back to the post being commented on, matching what the poll does.
+    post_key = _related_post_key(extra)
+    if post_key:
+        from apps.composer.models import PlatformPost
+
+        related_id = (
+            PlatformPost.objects.filter(social_account=account, platform_post_id=post_key)
+            .values_list("id", flat=True)
+            .first()
+        )
+        if related_id:
+            defaults["related_post_id"] = related_id
+
     obj, created = InboxMessage.objects.get_or_create(
         social_account=account,
         platform_message_id=platform_message_id,
-        defaults={
-            "workspace": account.workspace,
-            "message_type": message_type,
-            "sender_name": sender_name,
-            "sender_handle": sender_id,  # Platform user ID as fallback handle
-            "body": body,
-            "sentiment": analyze_sentiment(body),
-            "extra": extra,
-            "received_at": timezone.now(),
-        },
+        defaults=defaults,
     )
     if created:
         from .tasks import InboxSyncEngine

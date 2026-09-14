@@ -374,10 +374,10 @@ For example, if your `APP_URL` is `https://brightbean.example.com`, the Facebook
 
 ### Meta (Facebook, Instagram, Threads)
 
-Facebook, Instagram, and Threads all use the same Meta app credentials.
+Facebook and Instagram share the same Meta app credentials. Threads runs on the same Meta app but uses a **separate app identity** — its own App ID, App Secret, and redirect URI list (steps 6-7 below).
 
 1. Go to [Meta for Developers](https://developers.facebook.com/) and create a new app (type: **Business**)
-2. Under **App Settings → Basic**, copy your **App ID** and **App Secret**
+2. Under **App Settings → Basic**, copy your **App ID** and **App Secret** — the plain ones, for Facebook and Instagram. Once the Threads use case is added this page also lists a **Threads App ID** / **Threads App Secret**; those are a different app identity and belong in the Threads variables in step 7, not here.
 3. In the App Dashboard, go to **Use cases** and add the following four use cases. For each use case, click into it and go to **Permissions and features** to add the required optional permissions:
 
    **Use case: "Manage everything on your Page"** (Facebook)
@@ -399,13 +399,36 @@ Facebook, Instagram, and Threads all use the same Meta app credentials.
    ```
    {APP_URL}/social-accounts/callback/facebook/
    {APP_URL}/social-accounts/callback/instagram/
-   {APP_URL}/social-accounts/callback/threads/
    ```
-5. Set the environment variables:
+   > **Threads is separate.** Its callback does **not** belong here — the Threads use case keeps its own redirect URI list. See step 7.
+5. **Webhooks (required for the inbox).** In the App Dashboard, go to **Webhooks** (also reachable via **Use cases → Manage everything on your Page → Webhooks**) and subscribe to the **Page** object:
+   - **Callback URL:** `{APP_URL}/webhooks/facebook/`
+   - **Verify token:** the value of `FACEBOOK_WEBHOOK_VERIFY_TOKEN` from your `.env` (any random string; generate one and set the env var before clicking *Verify and save*)
+   - After verification, subscribe to the `feed`, `mention`, and `messages` fields. `feed` is what carries comments on your Page's posts.
+
+   > **This step is easy to miss and fails silently.** Connecting a Page subscribes it to your app automatically, so the account shows as healthy either way — but without the callback URL configured here, Meta never delivers anything. Comments then arrive only through the 5-minute polling fallback, and mentions not at all. Run `python manage.py diagnose_facebook --account-id <uuid>` to check.
+
+   **If you connect Instagram through this Facebook app, also subscribe to the `Instagram` object** on the same Webhooks page:
+   - **Callback URL:** `{APP_URL}/webhooks/facebook/` (the same endpoint — it handles both platforms)
+   - Subscribe to the `comments` and `mentions` fields.
+
+   > `comments` and `mentions` belong to the **Instagram** object, not the Page — a Page accepts only its own fields (`feed`, `mention`, `messages`, …). Studio subscribes the Instagram *account* automatically on connect, but the object-level configuration here can only be done in the dashboard. Without it, Instagram comments arrive only via the 5-minute poll and mentions not at all.
+6. Set the environment variables:
    ```
    PLATFORM_FACEBOOK_APP_ID=your-app-id
    PLATFORM_FACEBOOK_APP_SECRET=your-app-secret
+   FACEBOOK_WEBHOOK_VERIFY_TOKEN=your-random-verify-token
    ```
+7. **Threads:** the "Access the Threads API" use case gets its own App ID, App Secret, and redirect URIs. Go to **Use cases → Access the Threads API → Settings** and add the Threads redirect URI:
+   ```
+   {APP_URL}/social-accounts/callback/threads/
+   ```
+   Then copy the **Threads App ID** and **Threads App Secret** (also listed under **App settings → Basic**, alongside — and different from — your Facebook App ID) and set:
+   ```
+   PLATFORM_THREADS_APP_ID=your-threads-app-id
+   PLATFORM_THREADS_APP_SECRET=your-threads-app-secret
+   ```
+   These have no fallback: until both are set, Threads shows as **Not Configured** on the connect page. Sending the Facebook App ID to Threads fails with error `4476002`.
 
 ### Instagram (Direct, via Instagram Login)
 
@@ -570,8 +593,24 @@ python manage.py backfill_inbox --days 7
 
 Options:
 - `--days N` - Number of days to backfill (default: 7)
-- `--platform NAME` - Only backfill a specific platform (e.g., `youtube`, `linkedin`, `tiktok`)
+- `--platform NAME` - Only backfill a specific platform (e.g., `facebook`, `youtube`, `linkedin`, `tiktok`)
 - `--account-id UUID` - Only backfill a specific account
+
+For Facebook this recovers comments on the Page's posts from the last 30 days — useful after fixing a webhook that was never delivering, since comments missed while it was broken are otherwise invisible:
+
+```bash
+python manage.py backfill_inbox --platform facebook --days 30
+```
+
+## Inbox: Diagnosing a Facebook Page That Receives Nothing
+
+When a Page's comments never reach the inbox, or a post's first comment never appears, the cause is usually a permission that was not granted or a webhook that was never configured — neither of which is visible from inside the app. Ask Meta directly:
+
+```bash
+python manage.py diagnose_facebook --account-id <uuid>
+```
+
+It reports the token's granted scopes (a missing `pages_manage_engagement` is why first comments fail), which app is subscribed to the Page and to which fields (`feed` is what carries comments), and whether comments are readable at all. Add `--subscribe` to repair a missing Page subscription in place, or `--json` for output to paste into an incident.
 
 ## API & MCP for Agents
 
@@ -630,6 +669,7 @@ The MCP server lives at `POST {APP_URL}/api/v1/mcp` and speaks JSON-RPC 2.0 over
 | `schedule_post` | Create and schedule a post in one step | `create_posts` + `publish_directly` |
 | `schedule_draft` | Schedule an existing draft | `create_posts` + `publish_directly` |
 | `get_post` | Retrieve a post with aggregate status and per-platform state | — |
+| `list_posts` | List posts newest-first, with optional status filter and cursor pagination | — |
 | `cancel_post` | Revert a scheduled post back to draft | `create_posts` |
 | `search_media` | Find media assets by query, type, tags, or folder | — |
 | `get_media` | Retrieve a single media asset by ID | — |
@@ -684,6 +724,9 @@ Make sure the Tailwind watcher is running: `cd theme/static_src && npm run start
 
 **OAuth callback errors ("redirect URI mismatch")**
 The redirect URI registered on the platform must exactly match `{APP_URL}/social-accounts/callback/{platform}/`. Check that `APP_URL` in `.env` matches the URL you're accessing (including `http` vs `https` and port number).
+
+**Threads: "No app ID was provided in the request" (error `4476002`)**
+Threads uses its own App ID, not the Facebook one. Set `PLATFORM_THREADS_APP_ID` / `PLATFORM_THREADS_APP_SECRET` from **Use cases → Access the Threads API → Settings**, and register `{APP_URL}/social-accounts/callback/threads/` in that same panel — the Facebook Login redirect URI list does not cover Threads. See the [Meta](#meta-facebook-instagram-threads) section.
 
 **Background tasks not running (posts not publishing)**
 Make sure the worker is running: `python manage.py process_tasks`. In Docker: check `docker compose logs worker`.

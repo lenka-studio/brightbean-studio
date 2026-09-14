@@ -95,8 +95,19 @@ class SocialProvider(ABC):
 
         These are conditionally excluded from the OAuth init flow when the
         platform's analytics is disabled in ``AnalyticsPlatformConfig`` — so
-        a self-hoster whose Meta / TikTok app hasn't yet been approved for
-        the analytics scope can still connect accounts for publishing.
+        a self-hoster whose Facebook / TikTok / Google app hasn't yet been
+        approved for the analytics scope can still connect accounts for
+        publishing. Honored by ``facebook``, ``tiktok`` and ``youtube``.
+
+        NOT honored by ``instagram_login``, which lists
+        ``instagram_business_manage_insights`` in ``required_scopes``
+        unconditionally (as ``instagram`` has always done with
+        ``instagram_manage_insights``): the grant is frozen at connect time
+        while this toggle can flip afterwards, so deferring the scope minted
+        tokens that could never read insights once analytics was switched on.
+        The cost of that choice is that an Instagram app without the
+        permission added under *Permissions and features* now sees it on the
+        authorize URL — see the Instagram (Direct) setup steps in the README.
 
         Providers without analytics-specific scopes return the default `[]`.
         """
@@ -192,13 +203,91 @@ class SocialProvider(ABC):
         """Fetch inbox messages (comments, mentions, DMs)."""
         raise NotImplementedError(f"{self.platform_name} does not support inbox")
 
-    def reply_to_message(self, access_token: str, message_id: str, text: str, extra: dict | None = None) -> ReplyResult:
-        """Reply to an inbox message."""
+    def reply_to_message(
+        self,
+        access_token: str,
+        message_id: str,
+        text: str,
+        extra: dict | None = None,
+        *,
+        human_agent: bool = False,
+    ) -> ReplyResult:
+        """Reply to a direct message / conversation.
+
+        ``human_agent`` asks the provider to mark the reply as written by a
+        person rather than a bot. Meta requires this for replies sent more than
+        24 hours after the incoming message; providers without the concept
+        ignore it.
+        """
         raise NotImplementedError(f"{self.platform_name} does not support message replies")
+
+    def reply_to_comment(self, access_token: str, comment_id: str, text: str, extra: dict | None = None) -> ReplyResult:
+        """Reply to a comment or mention.
+
+        Separate from ``reply_to_message`` because platforms answer comments on
+        a different edge than conversations — replying to a comment through the
+        messaging endpoint silently fails.
+        """
+        raise NotImplementedError(f"{self.platform_name} does not support comment replies")
+
+    # ------------------------------------------------------------------
+    # Webhooks (optional - override per provider)
+    # ------------------------------------------------------------------
+
+    def subscribe_webhooks(self, access_token: str, account_id: str) -> bool:
+        """Subscribe this app to the account's webhook notifications.
+
+        Called when a user connects an account. Without it the platform never
+        pushes comments, mentions or messages to us and the inbox stays empty
+        for anything we cannot poll. Returns True when the subscription is
+        active.
+        """
+        return False
+
+    def unsubscribe_webhooks(self, access_token: str, account_id: str) -> bool:
+        """Remove this app's webhook subscription. Called on disconnect."""
+        return False
+
+    def find_own_comment(self, access_token: str, post_id: str, text: str) -> str | None:
+        """Return the id of a comment this account already posted with ``text``.
+
+        Reconciliation hook for retrying a comment whose first attempt failed
+        ambiguously (timeout, 5xx): the platform may have created it anyway, and
+        a blind retry would double-comment. Providers that cannot answer this
+        leave the default, and callers must then treat an ambiguous failure as
+        terminal rather than risk the duplicate.
+        """
+        raise NotImplementedError(f"{self.platform_name} cannot look up its own comments")
+
+    def get_webhook_subscriptions(self, access_token: str, account_id: str) -> list[dict]:
+        """Read back which apps are subscribed to this account, and to what.
+
+        Diagnostic counterpart to ``subscribe_webhooks``: a subscription that
+        was refused or silently dropped is otherwise invisible.
+        """
+        raise NotImplementedError(f"{self.platform_name} cannot report webhook subscriptions")
+
+    def debug_token(self, access_token: str) -> dict:
+        """Inspect an access token (validity, expiry, granted scopes)."""
+        raise NotImplementedError(f"{self.platform_name} does not support token inspection")
 
     # ------------------------------------------------------------------
     # Token management
     # ------------------------------------------------------------------
+
+    def get_granted_scopes(self, access_token: str) -> set[str] | None:
+        """Which of the requested scopes the platform actually granted.
+
+        Meta silently drops permissions it has not approved, or that the user
+        declined, rather than failing the grant — so a connection reports
+        healthy and only breaks later, at publish or insights time, with an
+        opaque platform error. Asking up front turns that into something we can
+        name while the user is still looking at the screen.
+
+        Returns ``None`` when the platform offers no way to ask, which callers
+        must treat as "unknown", never as "nothing granted".
+        """
+        return None
 
     def revoke_token(self, access_token: str) -> bool:
         """Revoke an OAuth token. Returns True if successful."""

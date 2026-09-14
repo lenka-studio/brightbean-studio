@@ -12,8 +12,14 @@ from datetime import datetime
 from urllib.parse import urlencode
 
 from .base import SocialProvider, is_video_url
-from .exceptions import APIError, OAuthError, PublishError
+from .exceptions import APIError, OAuthError, ProviderError, PublishError
+from .meta_comments import (
+    fetch_instagram_comments,
+    find_own_instagram_comment,
+    resolve_comment_reply_target,
+)
 from .meta_insights import fetch_insights_safe
+from .meta_oauth import facebook_login_params
 from .types import (
     AccountMetrics,
     AccountProfile,
@@ -35,6 +41,23 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://graph.facebook.com/v25.0"
 OAUTH_URL = "https://www.facebook.com/v25.0/dialog/oauth"
 TOKEN_URL = f"{BASE_URL}/oauth/access_token"
+# Subscribed on the Instagram user, NOT on the linked Facebook Page. These are
+# fields of Meta's *Instagram* webhook object; a Page accepts only its own
+# ({feed, mention, messages, ...}) and answers anything else with
+# "(#100) Param subscribed_fields[0] must be one of {...}". Sending them to the
+# Page is what left every Instagram inbox deaf to comments.
+#
+# The Page is also the wrong object on permissions: POST /{page-id}/subscribed_apps
+# needs ``pages_manage_metadata``, which this OAuth flow never requests, while
+# the Instagram user's edge is covered by the ``instagram_*`` scopes it does.
+# And ``subscribed_apps`` *replaces* a field list rather than merging into it,
+# so writing the Page from here would silently drop the mention and message
+# subscriptions of a Facebook Page connected in the same workspace.
+#
+# ``messages`` is deliberately absent: this OAuth flow does not request
+# ``instagram_manage_messages``, so Meta would reject the subscription and any
+# DM call. Instagram DMs are served by the Instagram-Login connection instead.
+INSTAGRAM_WEBHOOK_FIELDS = ["comments", "mentions"]
 INSTAGRAM_ACCOUNT_INSIGHTS = [
     "reach",
     "views",
@@ -132,13 +155,12 @@ class InstagramProvider(SocialProvider):
     # ------------------------------------------------------------------
 
     def get_auth_url(self, redirect_uri: str, state: str, code_verifier: str | None = None) -> str:
-        params = {
-            "client_id": self.credentials["client_id"],
-            "redirect_uri": redirect_uri,
-            "state": state,
-            "scope": ",".join(self.required_scopes),
-            "response_type": "code",
-        }
+        params = facebook_login_params(
+            client_id=self.credentials["client_id"],
+            redirect_uri=redirect_uri,
+            state=state,
+            scopes=self.required_scopes,
+        )
         return f"{OAUTH_URL}?{urlencode(params)}"
 
     def exchange_code(self, code: str, redirect_uri: str, code_verifier: str | None = None) -> OAuthTokens:
@@ -415,15 +437,39 @@ class InstagramProvider(SocialProvider):
     # ------------------------------------------------------------------
 
     def publish_comment(self, access_token: str, post_id: str, text: str) -> CommentResult:
+        """Comment on a media item (used for the first comment).
+
+        No ``fields`` param: Meta answers a comment POST that carries one with
+        error code 20 / subcode 1772107 ("does not support the requested
+        response format") *after* creating the comment. The call then reads as a
+        clean 400, the retry queue re-sends it, and the account ends up with one
+        comment per attempt.
+        """
         resp = self._request(
             "POST",
             f"{BASE_URL}/{post_id}/comments",
             access_token=access_token,
-            params={"fields": "id"},
             json={"message": text},
         )
         data = resp.json()
         return CommentResult(platform_comment_id=data["id"], extra=data)
+
+    def find_own_comment(self, access_token: str, post_id: str, text: str) -> str | None:
+        """Find a comment this account already left on ``post_id``.
+
+        Called before retrying a first comment whose previous attempt failed —
+        the platform may have created it anyway.
+        """
+        return find_own_instagram_comment(
+            self._request,
+            api_base=BASE_URL,
+            access_token=access_token,
+            media_id=post_id,
+            text=text,
+            # Both set by _resolve_publish_credentials in apps/publisher/engine.py.
+            own_id=str(self.credentials.get("ig_user_id") or ""),
+            own_handle=str(self.credentials.get("account_handle") or ""),
+        )
 
     # ------------------------------------------------------------------
     # Analytics
@@ -500,47 +546,131 @@ class InstagramProvider(SocialProvider):
     # Inbox
     # ------------------------------------------------------------------
 
+    # Instagram DMs are not available on this connection: the Facebook-Login
+    # flow does not request ``instagram_manage_messages``, so
+    # ``reply_to_message`` stays unimplemented and this account never appears in
+    # the DM surface. Accounts connected via Instagram Login do support them.
+
     def get_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
-        ig_user_id = self.credentials.get("ig_user_id", "me")
-        params: dict = {"fields": "id,participants,messages{id,message,from,created_time}"}
-        if since:
-            params["since"] = int(since.timestamp())
+        """Poll comments on the account's recent media.
 
-        resp = self._request(
-            "GET",
-            f"{BASE_URL}/{ig_user_id}/conversations",
+        Instagram comments have only ever reached the inbox by webhook, and that
+        webhook is subscribed on the *linked Page* (see ``subscribe_webhooks``)
+        — an object this app cannot confirm is delivering anything. An account
+        whose subscription never took is deaf to comments permanently with no
+        way to backfill; this poll is the backstop, exactly as FacebookProvider
+        does for a Page feed.
+        """
+        ig_user_id = str(self.credentials.get("ig_user_id") or "")
+        if not ig_user_id:
+            # Deliberately not falling back to ``_get_ig_user_id``: it picks the
+            # first Page with a linked IG account, and on a multi-page login
+            # that is a different account whose media we would poll into this
+            # workspace's inbox.
+            logger.warning("Skipping Instagram comment poll: no ig_user_id in credentials")
+            return []
+
+        return fetch_instagram_comments(
+            self._request,
+            platform=self.platform_name,
+            host=BASE_URL,
+            media_url=f"{BASE_URL}/{ig_user_id}/media",
             access_token=access_token,
-            params=params,
+            since=since,
+            owner_id=ig_user_id,
+            owner_handle=str(self.credentials.get("account_handle") or ""),
         )
-        conversations = resp.json().get("data", [])
 
-        messages: list[InboxMessage] = []
-        for convo in conversations:
-            for msg in convo.get("messages", {}).get("data", []):
-                sender = msg.get("from", {})
-                messages.append(
-                    InboxMessage(
-                        platform_message_id=msg["id"],
-                        sender_id=sender.get("id", ""),
-                        sender_name=sender.get("name", sender.get("username", "")),
-                        text=msg.get("message", ""),
-                        timestamp=datetime.fromisoformat(msg["created_time"].replace("+0000", "+00:00")),
-                        message_type="dm",
-                        extra={"conversation_id": convo["id"]},
-                    )
-                )
-        return messages
+    def reply_to_comment(self, access_token: str, comment_id: str, text: str, extra: dict | None = None) -> ReplyResult:
+        """Reply to a comment, or comment on a media item.
 
-    def reply_to_message(self, access_token: str, message_id: str, text: str, extra: dict | None = None) -> ReplyResult:
-        """Reply to a conversation. message_id should be the conversation ID."""
+        Which object and edge to post to depends on what the inbox item is —
+        see ``resolve_comment_reply_target``.
+        """
+        target, edge = resolve_comment_reply_target(comment_id, extra)
         resp = self._request(
             "POST",
-            f"{BASE_URL}/{message_id}/messages",
+            f"{BASE_URL}/{target}/{edge}",
             access_token=access_token,
             json={"message": text},
         )
         data = resp.json()
         return ReplyResult(platform_message_id=data.get("id", ""), extra=data)
+
+    def get_granted_scopes(self, access_token: str) -> set[str] | None:
+        """Read the grant back by inspecting the token itself.
+
+        Not ``/me/permissions``: these accounts hold a *Page* token, and ``/me``
+        resolves to whatever the token identifies — the Page, which has no
+        ``permissions`` edge. ``/debug_token`` reports the scopes carried by any
+        token, Page ones included, and is the documented way to ask.
+
+        Needs an app access token to make the call, so a provider built without
+        app credentials reports "unknown" rather than guessing.
+        """
+        client_id = self.credentials.get("client_id")
+        client_secret = self.credentials.get("client_secret")
+        if not client_id or not client_secret:
+            return None
+
+        try:
+            resp = self._request(
+                "GET",
+                f"{BASE_URL}/debug_token",
+                params={
+                    "input_token": access_token,
+                    # Meta's documented app-token form. Never log this.
+                    "access_token": f"{client_id}|{client_secret}",
+                },
+            )
+        except ProviderError:
+            logger.warning("Could not read granted permissions for %s", self.platform_name)
+            return None
+
+        data = resp.json().get("data") or {}
+        scopes = data.get("scopes")
+        if scopes is None:
+            # A token Meta declines to describe is unknown, not unscoped.
+            return None
+        return set(scopes)
+
+    def revoke_token(self, access_token: str) -> bool:
+        """Deliberately a no-op — see ``FacebookProvider.revoke_token``.
+
+        This connection shares the Facebook user's grant, so revoking it would
+        also sever every sibling connection. Left explicit rather than
+        inherited so the next reader does not "fix" it by adding
+        DELETE /me/permissions.
+        """
+        return False
+
+    # ------------------------------------------------------------------
+    # Webhooks
+    # ------------------------------------------------------------------
+
+    def subscribe_webhooks(self, access_token: str, account_id: str) -> bool:
+        """Subscribe to Instagram webhooks on the Instagram user.
+
+        ``account_id`` is the IG user ID, not the ID of the Facebook Page the
+        account is linked to — see ``INSTAGRAM_WEBHOOK_FIELDS`` for why the Page
+        cannot carry these fields. The app must also be subscribed to the
+        Instagram object in the Meta App Dashboard; no API call can set that.
+        """
+        resp = self._request(
+            "POST",
+            f"{BASE_URL}/{account_id}/subscribed_apps",
+            access_token=access_token,
+            params={"subscribed_fields": ",".join(INSTAGRAM_WEBHOOK_FIELDS)},
+        )
+        return bool(resp.json().get("success"))
+
+    def unsubscribe_webhooks(self, access_token: str, account_id: str) -> bool:
+        resp = self._request(
+            "DELETE",
+            f"{BASE_URL}/{account_id}/subscribed_apps",
+            access_token=access_token,
+        )
+        return bool(resp.json().get("success"))
 
     # ------------------------------------------------------------------
     # Helpers

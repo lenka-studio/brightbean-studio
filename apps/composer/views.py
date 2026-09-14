@@ -578,6 +578,9 @@ def compose(request, workspace_id, post_id=None):
         char_limits[str(acc.id)] = {
             "platform": acc.platform,
             "limit": acc.char_limit,
+            # Each of these costs two characters once the provider escapes it,
+            # so the live counter can charge for them as the user types.
+            "escaped_chars": acc.escaped_chars,
             "name": acc.account_name or acc.account_handle,
             **cfg,
         }
@@ -648,6 +651,13 @@ def compose(request, workspace_id, post_id=None):
     # user can see why a publish failed before retrying.
     failed_platform_posts = [
         pp for pp in platform_post_list if pp.status == PlatformPost.Status.FAILED and pp.publish_error
+    ]
+
+    # A first comment that failed leaves the post itself published, so it never
+    # shows up in the banner above — without this the post looks fully
+    # successful while the comment is silently missing.
+    failed_first_comments = [
+        pp for pp in platform_post_list if pp.first_comment_status == PlatformPost.FirstCommentStatus.FAILED
     ]
 
     # Build media_items for the initial preview render
@@ -729,6 +739,7 @@ def compose(request, workspace_id, post_id=None):
         # that account — the save endpoints use this to leave siblings alone.
         "account_scope": account_filter if (post_id and account_filter) else "",
         "failed_platform_posts": failed_platform_posts,
+        "failed_first_comments": failed_first_comments,
         "unsplash_enabled": bool(settings.UNSPLASH_ACCESS_KEY),
     }
     return render(request, "composer/compose.html", context)
@@ -1316,6 +1327,8 @@ def preview(request, workspace_id):
             effective_title = request.POST.get(override_title_key, "") or title
             effective_caption = request.POST.get(override_key, "") or caption
             char_limit = account.char_limit
+            # Counted after escaping, so the badge matches what gets published.
+            char_count = account.caption_wire_length(effective_caption)
             field_config = account.field_config
             previews.append(
                 {
@@ -1323,9 +1336,9 @@ def preview(request, workspace_id):
                     "title": effective_title,
                     "caption": effective_caption,
                     "first_comment": first_comment,
-                    "char_count": len(effective_caption),
+                    "char_count": char_count,
                     "char_limit": char_limit,
-                    "is_over_limit": len(effective_caption) > char_limit,
+                    "is_over_limit": char_count > char_limit,
                     "truncated_caption": effective_caption[:char_limit]
                     if len(effective_caption) > char_limit
                     else effective_caption,

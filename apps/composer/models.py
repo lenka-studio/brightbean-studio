@@ -356,6 +356,21 @@ class PlatformPost(models.Model):
     # user's call and intentionally bypasses this.
     PROTECTED_STATUSES = (Status.PUBLISHED, Status.PUBLISHING)
 
+    # Statuses whose scheduled time may be changed by a calendar drag-and-drop.
+    # A dropped draft/failed chip becomes ``scheduled`` (an implicit
+    # (re)schedule / retry); the others just move in time, keeping their status.
+    # ``published`` and ``publishing`` are excluded — the post is done or in
+    # flight and must not be dragged. Shared by the calendar chip templates and
+    # the reschedule endpoint so both agree on what's draggable.
+    RESCHEDULABLE_STATUSES = (
+        Status.DRAFT,
+        Status.APPROVED,
+        Status.SCHEDULED,
+        Status.FAILED,
+        Status.PENDING_REVIEW,
+        Status.PENDING_CLIENT,
+    )
+
     # Valid state transitions (from → set of allowed targets). Mirrors the old
     # Post-level state machine minus ``partially_published`` — that concept
     # only applies at the aggregate/Post level and is produced by
@@ -377,6 +392,12 @@ class PlatformPost(models.Model):
         "on_hold": {"approved", "draft", "changes_requested"},
         "published": set(),  # terminal
     }
+
+    class FirstCommentStatus(models.TextChoices):
+        NONE = "none", "Not requested"
+        PENDING = "pending", "Pending"
+        POSTED = "posted", "Posted"
+        FAILED = "failed", "Failed"
 
     STATUS_COLORS = {
         "draft": "gray",
@@ -435,6 +456,23 @@ class PlatformPost(models.Model):
     )
     publish_error = models.TextField(blank=True, default="")
     published_at = models.DateTimeField(blank=True, null=True)
+
+    # First-comment outcome. Kept in dedicated columns rather than in
+    # ``platform_extra``: that field is an *input* channel — the publish engine
+    # merges it into ``PublishContent.extra``, which providers forward into
+    # their API payloads — so status written there would ride along on the next
+    # publish. A post whose comment failed must also be distinguishable from a
+    # fully successful one, which needs a queryable column.
+    first_comment_status = models.CharField(
+        max_length=10,
+        choices=FirstCommentStatus.choices,
+        default=FirstCommentStatus.NONE,
+        db_index=True,
+    )
+    first_comment_id = models.CharField(max_length=255, blank=True, default="")
+    first_comment_error = models.TextField(blank=True, default="")
+    first_comment_retry_count = models.PositiveIntegerField(default=0)
+    first_comment_posted_at = models.DateTimeField(blank=True, null=True)
     scheduled_at = models.DateTimeField(
         blank=True,
         null=True,
@@ -459,6 +497,20 @@ class PlatformPost(models.Model):
 
     def __str__(self):
         return f"PlatformPost({self.social_account.platform}): {self.status}"
+
+    @property
+    def is_reschedulable(self):
+        """Whether this chip may be dragged to a new date on the calendar."""
+        return self.status in self.RESCHEDULABLE_STATUSES
+
+    @property
+    def is_bulk_selectable(self):
+        """Whether this row can be the target of a bulk draft/publish/delete.
+
+        Every branch of ``bulk_platform_action`` skips ``PROTECTED_STATUSES``, so
+        offering a checkbox on those rows would only ever be a no-op.
+        """
+        return self.status not in self.PROTECTED_STATUSES
 
     # ------------------------------------------------------------------
     # State machine
@@ -529,7 +581,9 @@ class PlatformPost(models.Model):
 
     @property
     def caption_length(self):
-        return len(self.effective_caption)
+        # Not len(): platforms that escape reserved characters send more than
+        # was typed, and the limit applies to what is sent.
+        return self.social_account.caption_wire_length(self.effective_caption)
 
     @property
     def is_over_limit(self):

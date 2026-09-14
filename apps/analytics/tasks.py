@@ -72,12 +72,14 @@ BACKFILL_DAYS_PER_PLATFORM: dict[str, int] = {
     "threads": 90,
     "google_business": 90,
     "tiktok": 60,
-    # Bluesky / Mastodon / LinkedIn-Personal have no analytics surface — skip.
-    # LinkedIn only exposes share statistics for Organization URNs, not
-    # personal Person URNs, regardless of granted scopes.
+    # Bluesky / Mastodon / LinkedIn-Personal / DEV.to have no analytics surface
+    # — skip. LinkedIn only exposes share statistics for Organization URNs, not
+    # personal Person URNs, regardless of granted scopes. Each of these must
+    # also appear in ``NO_ANALYTICS_PLATFORMS``.
     "bluesky": 0,
     "mastodon": 0,
     "linkedin_personal": 0,
+    "devto": 0,
 }
 DEFAULT_BACKFILL_DAYS = 90
 
@@ -254,32 +256,24 @@ def _account_metrics_to_dict(metrics, platform: str) -> dict[str, float]:
 
 
 def _resolve_provider(account):
-    """Mirror apps.social_accounts.tasks.check_social_account_health's credential
-    resolution so platforms with org-level creds (Meta apps, etc.) work."""
-    from apps.credentials.models import resolve_platform_credentials
+    """Build the provider for ``account`` with the same credentials the publish
+    engine and the health check use.
+
+    This used to be a hand-copy of ``_resolve_publish_credentials`` and had
+    drifted: no ``instagram_login`` branch (so Instagram Direct providers were
+    built with no ``ig_user_id`` / ``account_handle``) and no Bluesky
+    ``pds_url``. Calling the shared resolver is the only way that stays fixed.
+
+    Adopting it deliberately changes two Mastodon behaviours to match
+    publishing: ``MastodonAppRegistration``'s client_id/secret now apply only
+    when the org's own credentials don't already carry one, and an
+    ``instance_url`` that fails the SSRF check is dropped rather than passed
+    through (analytics for such an account fails instead of dialling it).
+    """
+    from apps.publisher.engine import _resolve_publish_credentials
     from providers import get_provider
 
-    # .env is dominant; admin-entered org credentials are the fallback.
-    credentials = resolve_platform_credentials(account.platform, account.workspace.organization_id)
-
-    if account.platform == "mastodon" and account.instance_url:
-        from apps.social_accounts.models import MastodonAppRegistration
-
-        try:
-            reg = MastodonAppRegistration.objects.get(instance_url=account.instance_url)
-            credentials = {
-                **credentials,
-                "instance_url": account.instance_url,
-                "client_id": reg.client_id,
-                "client_secret": reg.client_secret,
-            }
-        except MastodonAppRegistration.DoesNotExist:
-            pass
-    elif account.platform == "facebook":
-        credentials = {**credentials, "page_id": account.account_platform_id}
-    elif account.platform == "instagram":
-        credentials = {**credentials, "ig_user_id": account.account_platform_id}
-    return get_provider(account.platform, credentials)
+    return get_provider(account.platform, _resolve_publish_credentials(account))
 
 
 def _is_insufficient_scope(exc: Exception) -> bool:
@@ -387,13 +381,23 @@ def _needs_empty_follower_count_refresh(account) -> bool:
     return account.follower_count <= 0 and account.platform in _FOLLOWER_TOTAL_REFRESH_PLATFORMS
 
 
-def _sync_account_metrics(account, on_date: dt_date) -> None:
+def _sync_account_metrics(account, on_date: dt_date, *, force_today: bool = False) -> None:
     """Fetch account-level metrics for ``on_date`` and any recent missing days.
 
     Walks ``on_date`` and the prior ``_ACCOUNT_METRICS_RECENT_DAYS - 1`` days,
     skipping days that already have an :class:`AccountInsightsSnapshot`. For
     providers without lag (Instagram, Facebook) this is a no-op past
     ``on_date`` because the existing rows short-circuit the iteration.
+
+    ``force_today`` re-fetches ``on_date`` even when its rows already exist.
+    One-shot backfills pass it because they run at the moments the token's
+    reach may have *changed* — a connect, a reconnect, or an admin switching
+    the platform on — and the fetch is the only thing that surfaces an
+    insufficient-scope error and sets ``analytics_needs_reconnect``. Without
+    it, a same-day re-run finds today's rows present, skips every offset,
+    never calls the provider, and reports success for a token that cannot
+    read insights. The hourly cron does not pass it: there, existing rows
+    genuinely mean the work is done.
 
     For YouTube, also fetches per-video Analytics-API metrics (watch_time,
     avg_view_pct, shares) that the Data API can't provide per-post — see
@@ -422,8 +426,8 @@ def _sync_account_metrics(account, on_date: dt_date) -> None:
     for offset in range(recent_days):
         target = on_date - timedelta(days=offset)
         has_rows_for_day = AccountInsightsSnapshot.objects.filter(social_account=account, date=target).exists()
-        needs_current_follower_refresh = target == on_date and _needs_empty_follower_count_refresh(account)
-        if has_rows_for_day and not needs_current_follower_refresh:
+        needs_current_day_refetch = target == on_date and (force_today or _needs_empty_follower_count_refresh(account))
+        if has_rows_for_day and not needs_current_day_refetch:
             continue
         start = datetime.combine(target, time.min, tzinfo=tz)
         end = datetime.combine(target, time.max, tzinfo=tz)
@@ -641,14 +645,15 @@ def backfill_account_analytics(account_id: str, days: int | None = None) -> None
     its current cumulative metrics and write today's snapshot rows.
     """
     from apps.composer.models import PlatformPost
-    from apps.social_accounts.models import AnalyticsPlatformConfig, SocialAccount
+    from apps.social_accounts.models import SocialAccount
+
+    from . import services
 
     try:
         account = SocialAccount.objects.get(id=account_id)
     except SocialAccount.DoesNotExist:
         return
-    enabled = set(AnalyticsPlatformConfig.enabled_platforms())
-    if account.platform not in enabled:
+    if services.analytics_availability(account.platform) is not None:
         return
     cap = BACKFILL_DAYS_PER_PLATFORM.get(account.platform, DEFAULT_BACKFILL_DAYS)
     if cap == 0:
@@ -657,7 +662,7 @@ def backfill_account_analytics(account_id: str, days: int | None = None) -> None
     today = timezone.now().date()
     cutoff = timezone.now() - timedelta(days=days)
 
-    _sync_account_metrics(account, today)
+    _sync_account_metrics(account, today, force_today=True)
 
     posts = PlatformPost.objects.filter(
         social_account=account,
@@ -675,14 +680,24 @@ def sync_all_account_analytics() -> None:
     from apps.composer.models import PlatformPost
     from apps.social_accounts.models import AnalyticsPlatformConfig, SocialAccount
 
-    enabled = set(AnalyticsPlatformConfig.enabled_platforms())
-    if not enabled:
+    from . import services
+
+    # Filter on the same predicate the page and the agent API use, not just the
+    # admin toggle. A platform with no analytics API at all (DEV.to, Bluesky,
+    # ...) is "enabled" as far as AnalyticsPlatformConfig is concerned, and the
+    # ``cap_days == 0`` guard below only skips the per-post loop — so without
+    # this those accounts reached _sync_account_metrics every single hour, built
+    # a provider, and failed. They never write a snapshot row, so ``has_today_rows``
+    # never became True and the waste repeated forever.
+    enabled = AnalyticsPlatformConfig.enabled_platforms()
+    syncable = [p for p in enabled if services.analytics_availability(p, enabled) is None]
+    if not syncable:
         return
     today = timezone.now().date()
 
     accounts = SocialAccount.objects.filter(
         connection_status=SocialAccount.ConnectionStatus.CONNECTED,
-        platform__in=enabled,
+        platform__in=syncable,
     ).select_related("workspace")
     from .models import AccountInsightsSnapshot
 

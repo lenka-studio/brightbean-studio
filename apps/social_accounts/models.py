@@ -42,6 +42,42 @@ class SocialAccount(models.Model):
     # Instance URL for Mastodon and Bluesky PDS
     instance_url = models.URLField(max_length=500, blank=True, default="")
 
+    # Object we subscribed for webhook delivery, when it isn't this account
+    # itself. Instagram accounts connected via Facebook Login receive their
+    # comment and message events through the linked Page, so this holds that
+    # Page ID — needed to unsubscribe cleanly on disconnect.
+    webhook_target_id = models.CharField(max_length=255, blank=True, default="")
+
+    # Whether the platform is currently pushing this account's activity to us.
+    # Null means "not applicable" (the platform has no webhooks) or "not tried
+    # yet". False means the inbox will miss comments and mentions, which is
+    # invisible without saying so — publishing and analytics still work, so the
+    # connection itself stays healthy and `last_error` (owned by the periodic
+    # health check) must not be borrowed for it.
+    webhooks_active = models.BooleanField(null=True, blank=True, default=None)
+    webhook_error = models.CharField(max_length=500, blank=True, default="")
+    # Set when the subscription failed for a reason a retry cannot fix: the
+    # grant itself is missing what it needs. Splits the card's CTA between
+    # "Try again" (re-run the call) and "Reconnect" (get a new grant), so the
+    # warning never asks for something the UI doesn't offer.
+    webhook_needs_reconnect = models.BooleanField(default=False)
+    # The provider's own words about the last failure. `webhook_error` is
+    # rewritten for a human and is all the card shows; operators running
+    # `diagnose_facebook` need the error code and fbtrace_id this keeps.
+    webhook_error_detail = models.TextField(blank=True, default="")
+    # Consecutive failed attempts, so the periodic health check can stop
+    # re-trying a subscription that will never succeed. Reset by a success, by
+    # a reconnect, and by the user pressing "Try again".
+    webhook_retry_count = models.PositiveSmallIntegerField(default=0)
+
+    # Scopes we asked for that the grant came back without. Meta drops
+    # unapproved or declined permissions silently rather than failing the
+    # grant, so without this the account looks healthy and only breaks later at
+    # publish or insights time with an opaque platform error. Empty means
+    # "everything we asked for was granted", or that the platform gives us no
+    # way to ask.
+    missing_scopes = models.JSONField(default=list, blank=True)
+
     # Connection health
     connection_status = models.CharField(
         max_length=20,
@@ -74,6 +110,16 @@ class SocialAccount(models.Model):
 
     def __str__(self):
         return f"{self.account_name} ({self.get_platform_display()})"
+
+    @property
+    def display_label(self) -> str:
+        """Human name for pickers and filters: the account name, else the handle.
+
+        Mirrors the ``account_name|default:account_handle`` the channel filters
+        used inline, so a component that can only read one attribute (the
+        ``ui_select`` tag's ``label_field``) still renders the same text.
+        """
+        return self.account_name or self.account_handle
 
     @property
     def is_token_expiring_soon(self) -> bool:
@@ -143,6 +189,23 @@ class SocialAccount(models.Model):
     def char_limit(self) -> int:
         return self.PLATFORM_CHAR_LIMITS.get(self.platform, 2200)
 
+    @property
+    def escaped_chars(self) -> str:
+        """Characters this platform escapes, each costing two against the limit."""
+        from providers import CAPTION_ESCAPED_CHARS
+
+        return CAPTION_ESCAPED_CHARS.get(self.platform, "")
+
+    def caption_wire_length(self, text: str) -> int:
+        """Caption length as this platform counts it, after any escaping.
+
+        LinkedIn escapes reserved characters in the commentary it publishes, so
+        the typed length is not the length that counts against ``char_limit``.
+        """
+        from providers import caption_wire_length
+
+        return caption_wire_length(self.platform, text)
+
     # Platform-specific field configuration (which platforms need extra fields)
     PLATFORM_FIELD_CONFIG: dict[str, dict[str, Any]] = {
         "youtube": {
@@ -191,6 +254,21 @@ class SocialAccount(models.Model):
     def field_config(self) -> dict:
         """Return field configuration for this platform."""
         return {**self.PLATFORM_FIELD_DEFAULTS, **self.PLATFORM_FIELD_CONFIG.get(self.platform, {})}
+
+    @property
+    def keeps_platform_grant_on_disconnect(self) -> bool:
+        """True when disconnecting here cannot revoke the platform's grant.
+
+        The Facebook-Page flows share one grant across every Page and Instagram
+        account that person connected, so the only endpoint that would revoke
+        it takes all of them down at once — see
+        ``FacebookProvider.revoke_token``. Instagram Login is excluded: its
+        token belongs to the one account, so disconnect does revoke it.
+        """
+        return self.platform in {
+            PlatformCredential.Platform.FACEBOOK,
+            PlatformCredential.Platform.INSTAGRAM,
+        }
 
     def supports_first_comment(self) -> bool:
         """Whether this account can have a first comment posted by the worker.
@@ -270,6 +348,19 @@ class PlatformVisibility(models.Model):
     def __str__(self):
         return f"{self.get_platform_display()} ({'visible' if self.is_visible else 'hidden'})"
 
+    @classmethod
+    def visible_choices(cls) -> list[tuple[str, str]]:
+        """``Platform.choices`` minus the platforms an admin has hidden.
+
+        The single source for "what can be connected" — the connect page and
+        the sidebar's connect shortcuts both read it, so they can't drift
+        (the sidebar used to keep its own hand-maintained copy, which had
+        fallen behind by two platforms). Platforms without a row default to
+        visible, matching ``is_visible``.
+        """
+        hidden = set(cls.objects.filter(is_visible=False).values_list("platform", flat=True))
+        return [(value, label) for value, label in PlatformCredential.Platform.choices if value not in hidden]
+
 
 class AnalyticsPlatformConfig(models.Model):
     """Site-wide toggle controlling which platforms are enabled for the
@@ -292,6 +383,12 @@ class AnalyticsPlatformConfig(models.Model):
     )
     updated_at = models.DateTimeField(auto_now=True)
 
+    # Not a column: ``apps.analytics.signals.stash_previous_enabled`` writes the
+    # stored ``is_enabled`` here on pre_save so post_save can spot an off → on
+    # flip. Declared so that write type-checks; ``None`` means "not stashed",
+    # which is what the post_save reader already defaults to.
+    _previously_enabled: bool | None = None
+
     class Meta:
         db_table = "social_accounts_analytics_platform_config"
         verbose_name = "Analytics platform"
@@ -305,10 +402,16 @@ class AnalyticsPlatformConfig(models.Model):
     def enabled_platforms(cls) -> list[str]:
         """Return the list of platform slugs with analytics enabled.
 
-        Falls back to "all platforms" if no rows exist yet (fresh DB before
-        the seed migration has run). Otherwise honors only ``is_enabled=True``.
+        A platform with no row counts as enabled, matching ``is_enabled``'s
+        default and the fact that the admin forbids adding or deleting rows —
+        so a missing row always means "nothing has been said about this
+        platform", never "an admin turned it off". Without that, every platform
+        slug added after the seed migration (``devto`` was the first) had its
+        analytics silently switched off, which is invisible from the admin
+        because the platform isn't listed there either.
+
+        Driven off ``Platform.choices`` rather than the table, so a row left
+        behind by a renamed slug can't leak into the result.
         """
-        rows = list(cls.objects.values_list("platform", "is_enabled"))
-        if not rows:
-            return [value for value, _label in PlatformCredential.Platform.choices]
-        return [platform for platform, enabled in rows if enabled]
+        rows = dict(cls.objects.values_list("platform", "is_enabled"))
+        return [value for value, _label in PlatformCredential.Platform.choices if rows.get(value, True)]

@@ -52,6 +52,15 @@ class AccountSummary(Schema):
         2200,
         description="Maximum caption length the platform accepts. Reject locally before calling /posts.",
     )
+    escaped_chars: str = Field(
+        "",
+        description=(
+            "Characters the platform requires escaped, each costing two against ``char_limit``. "
+            "LinkedIn escapes its reserved little-text set, so count a caption as "
+            "``len(caption) + sum(caption.count(c) for c in escaped_chars)`` before rejecting it. "
+            "Empty for platforms that publish the caption verbatim."
+        ),
+    )
     needs_title: bool = Field(
         False,
         description="True when the platform requires a title (YouTube, Pinterest). When false, the title field is ignored.",
@@ -75,6 +84,7 @@ class AccountSummary(Schema):
             account_handle=getattr(sa, "account_handle", "") or "",
             connection_status=sa.connection_status,
             char_limit=sa.char_limit,
+            escaped_chars=sa.escaped_chars,
             needs_title=bool(sa.field_config.get("needs_title", False)),
             supports_first_comment=sa.supports_first_comment(),
         )
@@ -304,9 +314,15 @@ class PostResponse(Schema):
         It defaults to ``False`` so a new, unconverted call site fails closed —
         redacted — rather than leaking notes.
         """
-        platform_posts = [
-            PlatformPostSummary.from_platform_post(pp) for pp in post.platform_posts.select_related("social_account")
-        ]
+        # ``.select_related()`` builds a *new* queryset, which discards any
+        # prefetch cache and re-queries once per post — an N+1 on list views.
+        # Use the cache when the caller prefetched, and fall back otherwise so
+        # an un-prefetched single fetch still avoids a query per child.
+        if "platform_posts" in getattr(post, "_prefetched_objects_cache", {}):
+            children = post.platform_posts.all()
+        else:
+            children = post.platform_posts.select_related("social_account")
+        platform_posts = [PlatformPostSummary.from_platform_post(pp) for pp in children]
         return cls(
             id=post.id,
             workspace_id=post.workspace_id,

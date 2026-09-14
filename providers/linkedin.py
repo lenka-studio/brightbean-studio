@@ -56,6 +56,35 @@ def _encode_urn(urn: str) -> str:
     return quote(urn, safe="")
 
 
+# Characters LinkedIn treats as reserved in the Posts API "commentary"
+# (little-text) field. If any is sent unescaped, LinkedIn silently truncates the
+# commentary at the first occurrence (e.g. a "(" drops everything after it).
+# Each must be prefixed with a backslash to render literally. Public because the
+# escaping inflates the caption, so the composer counts against the escaped
+# length too (see providers.caption_wire_length).
+# https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/posts-api
+LINKEDIN_RESERVED_CHARS = "|{}@[]()<>#*_~"
+
+
+def escape_commentary(text: str) -> str:
+    """Escape LinkedIn's reserved little-text characters in a post commentary.
+
+    LinkedIn's Posts API truncates ``commentary`` at the first unescaped
+    reserved character, so a caption like "Va al repo (durable)" would publish
+    as just "Va al repo ". Prefix each reserved char with a backslash so the
+    full text renders literally. The backslash itself is escaped first to avoid
+    double-escaping the escapes we add.
+
+    Posts only: the Comments API takes plain text, not little-format.
+    """
+    if not text:
+        return text
+    escaped = text.replace("\\", "\\\\")
+    for ch in LINKEDIN_RESERVED_CHARS:
+        escaped = escaped.replace(ch, "\\" + ch)
+    return escaped
+
+
 class LinkedInProvider(SocialProvider):
     """LinkedIn Marketing API v2 provider."""
 
@@ -228,7 +257,7 @@ class LinkedInProvider(SocialProvider):
     def _build_post_body(self, author: str, commentary: str) -> dict:
         return {
             "author": author,
-            "commentary": commentary,
+            "commentary": escape_commentary(commentary),
             "visibility": "PUBLIC",
             "distribution": {
                 "feedDistribution": "MAIN_FEED",
@@ -493,6 +522,9 @@ class LinkedInProvider(SocialProvider):
             headers=LINKEDIN_HEADERS,
             json={
                 "actor": actor,
+                # Plain text on purpose: the Comments API is not little-format
+                # (mentions ride in a separate attributes[] array), so escaping
+                # would publish literal backslashes and shift mention offsets.
                 "message": {"text": text},
             },
         )
@@ -580,7 +612,19 @@ class LinkedInProvider(SocialProvider):
 
         return messages
 
-    def reply_to_message(self, access_token: str, message_id: str, text: str, extra: dict | None = None) -> ReplyResult:
+    def reply_to_comment(self, access_token: str, comment_id: str, text: str, extra: dict | None = None) -> ReplyResult:
+        """Reply to a comment. LinkedIn answers on the post's comment edge, so this is the same call."""
+        return self.reply_to_message(access_token, comment_id, text, extra)
+
+    def reply_to_message(
+        self,
+        access_token: str,
+        message_id: str,
+        text: str,
+        extra: dict | None = None,
+        *,
+        human_agent: bool = False,
+    ) -> ReplyResult:
         extra = extra or {}
         post_urn = extra.get("post_urn", "")
         if not post_urn:
@@ -599,6 +643,7 @@ class LinkedInProvider(SocialProvider):
             headers=LINKEDIN_HEADERS,
             json={
                 "actor": actor,
+                # Plain text, as in publish_comment above.
                 "message": {"text": text},
                 "parentComment": message_id,
             },
