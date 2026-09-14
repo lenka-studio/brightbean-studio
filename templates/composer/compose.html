@@ -529,6 +529,31 @@
                     </div>
                 </div>
 
+                <!-- Instagram settings (auto-visible when any Instagram account is selected) -->
+                <template x-for="accId in selectedAccounts" :key="'ig-settings-' + accId">
+                    <div x-show="charLimits[accId]?.platform === 'instagram' || charLimits[accId]?.platform === 'instagram_login'"
+                         class="border border-stone-200 rounded-xl bg-white p-4 space-y-3">
+                        <div class="flex items-center gap-2">
+                            <span class="platform-icon pi-instagram w-5 h-5 rounded-[5px] flex items-center justify-center"
+                                  x-html="platformIconSvg('instagram')"></span>
+                            <span class="text-xs font-semibold text-stone-600" x-text="charLimits[accId]?.name + ' - Post Type'"></span>
+                        </div>
+                        <div>
+                            <label class="block text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-1">Publish as</label>
+                            <select :name="'ig_post_type_' + accId"
+                                    class="w-full text-sm px-3 py-2 rounded-lg border border-stone-200 bg-white outline-none focus:border-orange-500 focus:ring-2 focus:ring-orange-100 transition-all"
+                                    @change="if (!platformExtras[accId]) platformExtras[accId] = {}; platformExtras[accId].post_type = $event.target.value">
+                                <option value="" :selected="!platformExtras[accId]?.post_type">Feed post (image, carousel, or a single video as a Reel)</option>
+                                <option value="reel" :selected="platformExtras[accId]?.post_type === 'reel'">Reel (one video)</option>
+                                <option value="story" :selected="platformExtras[accId]?.post_type === 'story'">Story (one image or video, gone after 24 hours)</option>
+                            </select>
+                            <p class="text-[11px] mt-1.5"
+                               :class="instagramMediaWarning(accId) ? 'text-amber-600' : 'text-stone-400'"
+                               x-text="instagramMediaWarning(accId) || instagramPostTypeHint(accId)"></p>
+                        </div>
+                    </div>
+                </template>
+
                 <!-- Pinterest settings (auto-visible when any Pinterest account is selected) -->
                 <template x-for="accId in selectedAccounts" :key="'pin-settings-' + accId">
                     <div x-show="charLimits[accId]?.platform === 'pinterest'"
@@ -2046,6 +2071,26 @@ function composerApp() {
             return firstLine.substring(0, 100);
         },
 
+        // Instagram post-type panel. #media-list mutates outside Alpine, so the
+        // counts are refreshed by syncVideoAttached() on the same events.
+        mediaCount: 0,
+        videoCount: 0,
+        instagramPostTypeHint(accId) {
+            const t = this.platformExtras[accId]?.post_type || '';
+            if (t === 'reel') return 'Attach exactly one video. Instagram publishes it as a Reel.';
+            if (t === 'story') return 'Attach exactly one image or video. Stories do not appear on the profile grid.';
+            return 'One image or video posts to the feed; two to ten items post as a carousel.';
+        },
+        instagramMediaWarning(accId) {
+            const t = this.platformExtras[accId]?.post_type || '';
+            const n = this.mediaCount;
+            const items = `${n} item${n === 1 ? '' : 's'} attached`;
+            if (t === 'reel' && (n !== 1 || this.videoCount !== 1)) return `Reels need exactly one video (${items}).`;
+            if (t === 'story' && n !== 1) return `Stories need exactly one image or video (${items}).`;
+            if (!t && n > 10) return `Instagram carousels hold at most 10 items (${items}).`;
+            return '';
+        },
+
         platformIconSvg(platform) {
             const s = 'width="14" height="14"';
             const icons = {
@@ -2121,6 +2166,9 @@ function composerApp() {
             // swaps #media-list when media is removed.
             const syncVideoAttached = () => {
                 this.hasVideoAttached = !!document.querySelector('#media-list video');
+                // Same source of truth for the Instagram post-type hints.
+                this.mediaCount = document.querySelectorAll('#media-list .media-thumb').length;
+                this.videoCount = document.querySelectorAll('#media-list video').length;
             };
             this.$nextTick(syncVideoAttached);
             document.body.addEventListener('previewUpdate', syncVideoAttached);

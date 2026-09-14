@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from datetime import datetime
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -29,6 +30,18 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 30.0
+
+
+VIDEO_URL_EXTENSIONS = (".mp4", ".mov")
+
+
+def is_video_url(url: str) -> bool:
+    """True when the URL's path ends in a video extension.
+
+    Only the path is inspected: presigned S3/R2 URLs carry a query string, so a
+    plain ``str.endswith`` check would misclassify every video as an image.
+    """
+    return urlsplit(url).path.lower().endswith(VIDEO_URL_EXTENSIONS)
 
 
 class SocialProvider(ABC):
